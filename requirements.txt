@@ -1,0 +1,9 @@
+fb-idb>=1.1.0
+pure-python-adb>=0.2.2.dev0
+mlx-openai-server>=1.6.0
+mlx-vlm>=0.4.0
+openai>=1.0.0
+typer>=0.9.0
+rich>=13.0.0
+fastmcp>=0.1.0
+huggingface_hub>=0.20.0

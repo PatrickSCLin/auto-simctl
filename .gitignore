@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables / secrets
+.env
+.env.*
+*.secret
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+*.icloud
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# Test screenshots & artifacts
+*.png
+*.jpg
+*.jpeg
+screenshots/
+test_outputs/
+
+# Model cache (don't commit weights)
+*.bin
+*.safetensors
+*.gguf
+*.mlpackage/
+
+# Logs
+*.log
+logs/
+
+# Runtime state files
+.current_task.pid
+.current_task.json
+
+# Cursor IDE project data
+.cursor/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# idb / adb artifacts
+*.dSYM/
