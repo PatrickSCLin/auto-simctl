@@ -157,7 +157,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="UI-UG-7B HTTP inference server")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--host", default="127.0.0.1")
@@ -172,3 +173,7 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         print("[ui_server] Shutting down", flush=True)
+
+
+if __name__ == "__main__":
+    main()

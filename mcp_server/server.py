@@ -28,10 +28,22 @@ One-shot action rules (act)
 
 Tools
 -----
-  list_devices()               List all booted simulators / connected devices
-  get_screen_state()           Current screen: JSON summary + screenshot image
-  act(task)                    ONE atomic action from current state (no reset)
-  run_task(task)               Full autonomous multi-step AI task (with HOME reset)
+  start_servers()               Start Qwen (:8080) + UI-UG (:8081) inference servers
+  stop_servers()                Stop both inference servers (free GPU/memory)
+  list_devices()                List all booted simulators / connected devices
+  get_screen_state()            Current screen: JSON summary + screenshot image
+  act(task)                     ONE atomic action from current state (no reset)
+
+Typical session
+---------------
+  1. start_servers()            ← start AI inference servers (once per session)
+  2. list_devices()             ← find your device UDID
+  3. get_screen_state()         ← see current screen
+  4. act("tap Settings")        ← take one action
+  5. get_screen_state()         ← observe result, decide next action
+  6. act("scroll down")         ← take next action
+     … repeat 4-5 until goal reached …
+  7. stop_servers()             ← free GPU/memory when done
 
 Setup (Cursor / Claude Desktop)
 --------------------------------
@@ -40,15 +52,20 @@ Add to your MCP config:
   {
     "mcpServers": {
       "auto-simctl": {
+        "command": "auto-simctl-mcp"
+      }
+    }
+  }
+
+  Or if installed from source:
+  {
+    "mcpServers": {
+      "auto-simctl": {
         "command": "python3",
         "args": ["/path/to/auto-simctl/mcp_server/server.py"]
       }
     }
   }
-
-Prerequisites
--------------
-  python3 cli.py server start   # start Qwen (:8080) + UI-UG (:8081) servers
 """
 from __future__ import annotations
 
@@ -84,9 +101,13 @@ mcp = FastMCP(
     "auto-simctl",
     instructions=(
         "auto-simctl controls iOS Simulators and Android devices from natural language. "
-        "Use get_screen_state to observe the current screen (returns JSON + screenshot), "
-        "then act() to issue a single atomic command, or run_task() for a full multi-step goal. "
-        "Typical vibe-coding loop: get_screen_state → act → get_screen_state → act → …"
+        "IMPORTANT: Call start_servers() first to start the AI inference servers before "
+        "using act() with non-gesture commands. Gesture commands "
+        "(swipe, scroll, back) work without servers. "
+        "The caller (you) drives the decision loop — use get_screen_state() to observe, "
+        "then act() to execute one atomic action, then get_screen_state() again. "
+        "Typical session: start_servers() → list_devices() → get_screen_state() → "
+        "act() → get_screen_state() → act() → … → stop_servers()."
     ),
 )
 
@@ -115,7 +136,7 @@ def _resolve_device(device_udid: str) -> tuple[str, str]:
     return device_udid, ""
 
 
-def _get_orchestrator(max_steps: int = 20):
+def _get_orchestrator():
     """Lazily build the Orchestrator (imports heavy deps only when needed)."""
     from agents.qwen_agent import QwenAgent
     from agents.ui_agent import UIAgent
@@ -124,7 +145,7 @@ def _get_orchestrator(max_steps: int = 20):
     bridge = _get_bridge()
     qwen = QwenAgent()
     ui = UIAgent()
-    return Orchestrator(mdb=bridge, qwen=qwen, ui_agent=ui, max_steps=max_steps)
+    return Orchestrator(mdb=bridge, qwen=qwen, ui_agent=ui, max_steps=5)
 
 
 def _check_servers() -> str | None:
@@ -141,9 +162,314 @@ def _check_servers() -> str | None:
         return (
             "Required inference servers are not running: "
             + ", ".join(missing)
-            + ". Start them with: python3 cli.py server start"
+            + ". Call the start_servers() MCP tool to start them, then retry."
         )
     return None
+
+
+# ── Server lifecycle helpers ──────────────────────────────────────────────────
+
+# All runtime files are stored in ~/.auto-simctl/ so every MCP instance
+# (Cursor spawns 3+) shares the same PID / lock / log files.
+_RUNTIME_DIR   = os.path.join(os.path.expanduser("~"), ".auto-simctl")
+os.makedirs(_RUNTIME_DIR, exist_ok=True)
+
+_QWEN_PID_FILE  = os.path.join(_RUNTIME_DIR, "qwen_server.pid")
+_UIUG_PID_FILE  = os.path.join(_RUNTIME_DIR, "uiug_server.pid")
+_QWEN_LOG_FILE  = os.path.join(_RUNTIME_DIR, "qwen_server.log")
+_UIUG_LOG_FILE  = os.path.join(_RUNTIME_DIR, "uiug_server.log")
+_START_LOCK_FILE = os.path.join(_RUNTIME_DIR, "start_servers.lock")
+
+
+def _read_pid(path: str) -> int | None:
+    try:
+        return int(open(path).read().strip())
+    except Exception:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _already_started(pid_file: str) -> bool:
+    """Return True if a live process is already recorded in pid_file."""
+    pid = _read_pid(pid_file)
+    return pid is not None and _pid_alive(pid)
+
+
+def _find_binary(name: str) -> str:
+    """
+    Locate a binary by name using multiple strategies:
+    1. shutil.which (respects PATH)
+    2. Same directory as the real Python interpreter (resolving symlinks)
+    3. Same directory as the auto-simctl-mcp entry point
+    Raises FileNotFoundError with install instructions if nothing is found.
+    """
+    import shutil
+    import sys
+
+    # 1. Standard PATH lookup
+    found = shutil.which(name)
+    if found:
+        return found
+
+    # 2. Resolve the real Python bin directory (handles /usr/local/bin symlinks)
+    real_python = os.path.realpath(sys.executable)
+    candidate = os.path.join(os.path.dirname(real_python), name)
+    if os.path.isfile(candidate):
+        return candidate
+
+    # 3. Same directory as the auto-simctl-mcp script itself
+    mcp_bin = shutil.which("auto-simctl-mcp")
+    if mcp_bin:
+        candidate = os.path.join(os.path.dirname(os.path.realpath(mcp_bin)), name)
+        if os.path.isfile(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        f"'{name}' not found. Install it with: pip install mlx-openai-server"
+    )
+
+
+def _find_ui_server_script() -> str:
+    """
+    Locate ui_server.py whether installed as a package or run from source.
+    Prefers the installed auto-simctl-ui-server entry point, then importlib.
+    """
+    import shutil
+    import importlib.util
+
+    # Prefer the installed entry-point binary
+    ep = shutil.which("auto-simctl-ui-server")
+    if ep:
+        return ep  # caller invokes it directly as a script
+
+    # Fall back to the module file (works for editable + regular installs)
+    spec = importlib.util.find_spec("ui_server")
+    if spec and spec.origin:
+        return spec.origin  # caller uses: python3 <path>
+
+    raise FileNotFoundError(
+        "ui_server not found. Re-install auto-simctl: pip install --upgrade auto-simctl"
+    )
+
+
+def _start_background(cmd: list[str], log_path: str, pid_path: str) -> int:
+    """Launch cmd in background, redirect output to log_path, write PID to pid_path."""
+    import subprocess
+    with open(log_path, "a") as lf:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=lf,
+            stderr=lf,
+            start_new_session=True,
+        )
+    open(pid_path, "w").write(str(proc.pid))
+    return proc.pid
+
+
+def _kill_pid_file(label: str, pid_path: str) -> str:
+    import signal
+    pid = _read_pid(pid_path)
+    if pid and _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return f"{label} stopped (PID {pid})"
+        except Exception as e:
+            return f"{label}: failed to stop — {e}"
+    return f"{label} was not running"
+
+
+# ── Tool: start_servers ───────────────────────────────────────────────────────
+
+@mcp.tool()
+def start_servers(
+    qwen_model: str = str(
+        os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub",
+                     "qwen3.5-9b-mlx-4bit")
+    ),
+    uiug_model: str = str(
+        os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub",
+                     "ui-ug-7b-2601-4bit")
+    ),
+    qwen_port: int = 8080,
+    uiug_port: int = 8081,
+    timeout: int = 120,
+) -> str:
+    """
+    Start the Qwen reasoning server and the UI-UG vision server in the background.
+
+    CALL THIS FIRST before using act() or run_task() with non-gesture commands.
+    Gesture-only commands (swipe, scroll, back) work without servers.
+
+    Both servers are long-running background processes — they persist after this
+    call returns.  You only need to call start_servers() once per session; the
+    servers stay alive until stop_servers() is called or the machine reboots.
+
+    Args:
+        qwen_model: Path to the Qwen MLX model directory (default: auto-detected).
+        uiug_model: Path to the UI-UG model directory (default: auto-detected).
+        qwen_port:  Port for the Qwen reasoning server (default 8080).
+        uiug_port:  Port for the UI-UG vision server (default 8081).
+        timeout:    Seconds to wait for each server to become ready (default 120).
+
+    Returns:
+        JSON with status of both servers: { "qwen": "...", "uiug": "...", "ready": bool }
+    """
+    import fcntl
+    import sys
+
+    from agents.qwen_agent import QwenAgent
+    from agents.ui_agent import UIAgent
+
+    # ── Exclusive file lock — prevents multiple MCP instances from starting
+    #    duplicate servers concurrently (Cursor spawns 3+ extension-host procs).
+    lock_fd = open(_START_LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return _start_servers_locked(
+            qwen_model=qwen_model,
+            uiug_model=uiug_model,
+            qwen_port=qwen_port,
+            uiug_port=uiug_port,
+            timeout=timeout,
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def _start_servers_locked(
+    qwen_model: str,
+    uiug_model: str,
+    qwen_port: int,
+    uiug_port: int,
+    timeout: int,
+) -> str:
+    """Actual start logic — must only be called while holding _START_LOCK_FILE."""
+    import sys
+
+    from agents.qwen_agent import QwenAgent
+    from agents.ui_agent import UIAgent
+
+    results: dict[str, Any] = {}
+
+    # ── Validate model paths before attempting to start ───────────────────────
+    if not os.path.isfile(os.path.join(qwen_model, "config.json")):
+        results["qwen"] = (
+            f"ERROR: Qwen model not found at '{qwen_model}'. "
+            "Download it with: "
+            "python3 -c \"from huggingface_hub import snapshot_download; "
+            "snapshot_download('mlx-community/Qwen3.5-9B-4bit', "
+            "local_dir='~/.cache/huggingface/hub/qwen3.5-9b-mlx-4bit')\""
+        )
+    if not os.path.isfile(os.path.join(uiug_model, "config.json")):
+        results["uiug"] = (
+            f"ERROR: UI-UG model not found at '{uiug_model}'. "
+            "Download it with: "
+            "python3 -c \"from huggingface_hub import snapshot_download; "
+            "snapshot_download('neovateai/UI-UG-7B-2601', "
+            "local_dir='~/.cache/huggingface/hub/ui-ug-7b-2601')\""
+        )
+    if results:
+        results["ready"] = False
+        return json.dumps(results, ensure_ascii=False)
+
+    # ── Qwen ─────────────────────────────────────────────────────────────────
+    qwen = QwenAgent(model_path=qwen_model)
+    # Double-check: port listening OR live PID already recorded
+    if qwen.server_running() or _already_started(_QWEN_PID_FILE):
+        results["qwen"] = f"already running on port {qwen_port}"
+    else:
+        try:
+            mlx_bin = _find_binary("mlx-openai-server")
+        except FileNotFoundError as e:
+            results["qwen"] = f"ERROR: {e}"
+            results["uiug"] = "skipped (Qwen failed)"
+            results["ready"] = False
+            return json.dumps(results, ensure_ascii=False)
+
+        _start_background(
+            [mlx_bin, "launch",
+             "--model-path", qwen_model,
+             "--model-type", "multimodal",
+             "--port", str(qwen_port),
+             "--host", "127.0.0.1",
+             "--max-tokens", "4096"],
+            log_path=_QWEN_LOG_FILE,
+            pid_path=_QWEN_PID_FILE,
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if qwen.server_running():
+                break
+            time.sleep(2)
+        if qwen.server_running():
+            results["qwen"] = f"started and ready on port {qwen_port}"
+        else:
+            results["qwen"] = (
+                f"ERROR: did not become ready within {timeout}s. "
+                f"Check logs: {_QWEN_LOG_FILE}"
+            )
+
+    # ── UI-UG ─────────────────────────────────────────────────────────────────
+    ui = UIAgent(server_url=f"http://127.0.0.1:{uiug_port}")
+    if ui.server_running() or _already_started(_UIUG_PID_FILE):
+        results["uiug"] = f"already running on port {uiug_port}"
+    else:
+        try:
+            ui_script = _find_ui_server_script()
+        except FileNotFoundError as e:
+            results["uiug"] = f"ERROR: {e}"
+            results["ready"] = False
+            return json.dumps(results, ensure_ascii=False)
+
+        if ui_script.endswith(".py"):
+            ui_cmd = [sys.executable, ui_script,
+                      "--port", str(uiug_port), "--model-path", uiug_model]
+        else:
+            ui_cmd = [ui_script, "--port", str(uiug_port), "--model-path", uiug_model]
+
+        _start_background(ui_cmd, log_path=_UIUG_LOG_FILE, pid_path=_UIUG_PID_FILE)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if ui.server_running():
+                break
+            time.sleep(2)
+        if ui.server_running():
+            results["uiug"] = f"started and ready on port {uiug_port}"
+        else:
+            results["uiug"] = (
+                f"ERROR: did not become ready within {timeout}s. "
+                f"Check logs: {_UIUG_LOG_FILE}"
+            )
+
+    results["ready"] = all("ERROR" not in v for v in results.values())
+    return json.dumps(results, ensure_ascii=False)
+
+
+# ── Tool: stop_servers ────────────────────────────────────────────────────────
+
+@mcp.tool()
+def stop_servers() -> str:
+    """
+    Stop the Qwen reasoning server and UI-UG vision server.
+
+    Use this to free GPU/memory when you are done with act() / run_task() tasks.
+    Gesture commands (swipe, scroll, back) will continue to work after stopping.
+
+    Returns:
+        JSON with stop status for each server.
+    """
+    return json.dumps({
+        "qwen": _kill_pid_file("Qwen", _QWEN_PID_FILE),
+        "uiug": _kill_pid_file("UI-UG", _UIUG_PID_FILE),
+    }, ensure_ascii=False)
 
 
 # ── Tool: list_devices ────────────────────────────────────────────────────────
@@ -402,70 +728,6 @@ def act(
         ensure_ascii=False,
     )
 
-
-# ── Tool: run_task ────────────────────────────────────────────────────────────
-
-@mcp.tool()
-def run_task(
-    task: str,
-    device_udid: str = "auto",
-    max_steps: int = 20,
-) -> str:
-    """
-    Run a full multi-step AI-driven task on a device, starting from the HOME screen.
-
-    The agent will autonomously:
-    1. Navigate to the home screen (pre-flight reset)
-    2. Take screenshots and read accessibility elements each step
-    3. Decide and execute actions using the Qwen reasoning model
-    4. Repeat until the task is complete or max_steps is reached
-
-    Use this for complex goals like "Open Settings → Wi-Fi → toggle off".
-    For single-step commands, prefer act() instead (faster, no reset).
-
-    Args:
-        task:        Natural language goal, e.g. "Open Files app and find recent documents"
-        device_udid: Device UDID or "auto" (default) for the first booted device.
-        max_steps:   Maximum number of actions before giving up (default 20).
-
-    Returns:
-        JSON with: success, conclusion, steps_taken, blocked_reason, and per-step logs.
-    """
-    udid, err = _resolve_device(device_udid)
-    if err:
-        return err
-
-    server_err = _check_servers()
-    if server_err:
-        return json.dumps({"success": False, "error": server_err})
-
-    orch = _get_orchestrator(max_steps=max_steps)
-    try:
-        result = orch.run(task=task, device_udid=udid, reset=True)
-    except Exception as e:
-        log.error(f"run_task failed: {e}")
-        return json.dumps({"success": False, "error": str(e)})
-
-    # Include a concise evidence list (no raw screenshots — too large for MCP)
-    evidence = [
-        {
-            "step": log_entry.step,
-            "action": str(log_entry.action),
-            "error": log_entry.error,
-        }
-        for log_entry in result.logs
-    ]
-    return json.dumps(
-        {
-            "success": result.success,
-            "conclusion": result.conclusion,
-            "steps_taken": result.steps_taken,
-            "blocked_reason": result.blocked_reason,
-            "evidence": evidence,
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
