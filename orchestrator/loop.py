@@ -695,18 +695,71 @@ class Orchestrator:
             if self.on_step:
                 self.on_step(step_log)
 
+            # ── 5b. Guard: input_text → done without ENTER ───────────────────
+            # If Qwen calls done immediately after input_text (e.g. typed a URL
+            # but forgot to press ENTER), intercept and inject press_key(ENTER).
+            last_was_input = (
+                len(history) >= 1 and
+                "input_text" in str(history[-1].get("action", ""))
+            )
+            if action.action_type == "done" and last_was_input:
+                log.warning(
+                    "Qwen called done right after input_text — "
+                    "injecting press_key(ENTER) to submit"
+                )
+                enter_action = Action(
+                    action_type="press_key", key="ENTER",
+                    reasoning="Auto-injected ENTER after input_text before done.",
+                )
+                self.mdb.execute(device_udid, enter_action)
+                time.sleep(0.5)
+                # Continue the loop; Qwen will re-evaluate on the next step
+
             # ── 6. Terminal actions ────────────────────────────────────────────
             if action.action_type == "done":
-                log.info(f"Task done: {action.result}")
-                return TaskResult(
-                    success=True,
-                    task=task,
-                    plan=task_plan,
-                    steps_taken=step,
-                    conclusion=action.result or "Task completed.",
-                    logs=logs,
-                    device_udid=device_udid,
-                )
+                # ── Done verification: re-screenshot + ask Qwen to confirm ──
+                # Prevents false positives where Qwen hallucinates completion.
+                log.info(f"Qwen says done: '{action.result}' — verifying with fresh screenshot...")
+                try:
+                    verify_shot = self.mdb.screenshot(device_udid)
+                    set_current_screenshot(verify_shot.png_bytes)
+                    verify_elements = self.mdb.list_elements(device_udid)
+                    verify_action = self.qwen.decide(
+                        task=f"VERIFY ONLY: Is this task actually complete? Task: {task}\n"
+                             f"Qwen previously said done: '{action.result}'\n"
+                             f"Look at the CURRENT screenshot and elements carefully. "
+                             f"If the task result is clearly visible on screen → output done. "
+                             f"If NOT (e.g. wrong page, URL not loaded, content missing) → output the next action needed.",
+                        screenshot_data_url=verify_shot.data_url,
+                        screenshot_url=get_screenshot_url(),
+                        ui_elements=verify_elements,
+                        history=history,
+                        step=step,
+                        max_steps=self.max_steps,
+                        nav_stack=nav_stack,
+                        foreground_app=foreground_app,
+                    )
+                    log.info(f"Verification result: {verify_action}")
+                    if verify_action.action_type == "done":
+                        log.info(f"Task done (verified): {verify_action.result or action.result}")
+                        return TaskResult(
+                            success=True, task=task, plan=task_plan,
+                            steps_taken=step,
+                            conclusion=verify_action.result or action.result or "Task completed.",
+                            logs=logs, device_udid=device_udid,
+                        )
+                    else:
+                        log.warning("Verification failed — continuing loop with corrected action.")
+                        action = verify_action
+                        # Fall through to execute the corrected action
+                except Exception as e:
+                    log.warning(f"Verification screenshot failed ({e}) — accepting original done.")
+                    return TaskResult(
+                        success=True, task=task, plan=task_plan,
+                        steps_taken=step,
+                        conclusion=action.result or "Task completed.",
+                        logs=logs, device_udid=device_udid,
+                    )
             if action.action_type == "error":
                 log.warning(f"Task error: {action.result}")
                 return TaskResult(
