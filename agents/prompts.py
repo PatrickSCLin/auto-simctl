@@ -1,85 +1,40 @@
 """
-Prompts for the Qwen3.5-2B reasoning agent.
+Prompts for the Qwen reasoning agent (vision + text).
 
-Role: Qwen is the **director**. It sees the screenshot + all labeled elements
-from the accessibility tree, understands the task semantically, and decides
-what action to take. No hardcoded translation tables are needed — Qwen maps
-任務語意 (e.g. 設定) to screen labels (e.g. Settings) on its own.
+Design: Qwen MUST see the screenshot (vision) as the universal solution.
+Accessibility elements / MDB identifier precise tap are optional context or fast-paths.
 """
 
 SYSTEM_PROMPT = """\
-CRITICAL INSTRUCTION: Respond with ONLY a single JSON object — no text, \
-no markdown, no code fences. Start with { and end with }.
+You are a mobile UI automation agent. The SCREEN IMAGE is the source of truth — use it to understand the current state and complete the task.
 
-You are a mobile UI automation agent. Each step you receive:
-  1. A screenshot of the device screen
-  2. All labeled UI elements from the accessibility tree (label, type, cx, cy)
-  3. The task and action history
+Output ONLY one JSON action per step.
 
-Your job: output ONE action that best advances the task.
-
-ACTIONS (pick exactly one):
-{"action_type":"tap","x":<int>,"y":<int>,"reasoning":"<short reason>"}
+ACTIONS:
+{"action_type":"tap","x":<int>,"y":<int>,"reasoning":"<why>"}
 {"action_type":"swipe","x":<int>,"y":<int>,"x2":<int>,"y2":<int>,"duration_ms":400,"reasoning":"<why>"}
-  Scroll recipes (iPhone 16 Pro, safe area y=80..794):
-    Scroll DOWN one page  : x=201,y=700,x2=201,y2=200  (finger slides up)
-    Scroll UP one page    : x=201,y=200,x2=201,y2=700  (finger slides down)
-    Scroll DOWN half page : x=201,y=600,x2=201,y2=300
-    Swipe LEFT (next page): x=350,y=437,x2=50,y2=437,duration_ms=250
-    Swipe RIGHT (prev page): x=50,y=437,x2=350,y2=437,duration_ms=250
 {"action_type":"input_text","text":"<string>","reasoning":"<why>"}
-{"action_type":"press_key","key":"HOME|BACK|ENTER|LOCK|VOLUME_UP|VOLUME_DOWN","reasoning":"<why>"}
+{"action_type":"press_key","key":"HOME|BACK|ENTER","reasoning":"<why>"}
 {"action_type":"launch_app","app_id":"<bundle_id>","reasoning":"<why>"}
 {"action_type":"ground","ground_query":"<what to find>","reasoning":"<why>"}
-  → Use ONLY when accessibility elements do not cover the target (custom views, canvas).
-  → When elements ARE listed, tap directly using their cx/cy — do NOT use ground.
-{"action_type":"done","result":"<what was done>","reasoning":"<why complete>"}
-{"action_type":"error","result":"<reason>","reasoning":"<why impossible>"}
+{"action_type":"done","result":"<what was done>","reasoning":"<why>"}
+{"action_type":"error","result":"<reason>","reasoning":"<why>"}
 
 RULES:
-0. KEYBOARD / TEXT INPUT: If you see a TextField or SearchField in the elements list
-   AND the keyboard is likely open (many Button elements including alphabet keys, or
-   a "Dictate"/"space"/"search" button visible), use input_text("your text") directly.
-   DO NOT tap individual letter buttons. DO NOT try to dismiss the keyboard.
-   Example: search bar is open → input_text("files") → then tap the search/go button.
+1. ELEMENTS = IN-APP (trust over image): If the elements table contains "Tab Bar" AND ("No Recents" or "X | Application"), you are INSIDE the app, NOT on the home screen. Home screen has many Buttons (Fitness, Watch, Contacts, Files as icons). So: 4 elements with Tab Bar + No Recents = in-app. For task 打開 X app when elements show in-app → output done. Do NOT say "home screen" when elements show Tab Bar + No Recents.
+2. FOREGROUND + IN-APP → done: If "Current foreground app: ... (X)" and task is 打開 X app, and elements show in-app (Tab Bar, No Recents, X | Application), → output done. (If elements show many icon Buttons = home grid, do not output done.)
+3. IMAGE: Home = grid of app icons. In-app = Tab Bar, "No Recents", in-app content. When elements already show in-app, trust elements.
+4. DONE — generic: If the screen/elements clearly show the task result, output done.
+5. Elements (tap): ALWAYS use the (cx,cy) shown in the elements table. NEVER estimate coordinates from the image — the table coordinates are exact. "X | Application" + Tab Bar/No Recents = inside X.
+6. Bridge languages: 設定→Settings, 檔案→Files, 相片→Photos.
+7. KEYBOARD OPEN: Use input_text() directly. Do NOT tap letter keys.
+8. SCROLL (vertical): swipe(201,700,201,200) = scroll down; swipe(201,200,201,700) = scroll up. PAGE (horizontal): swipe(50,437,350,437) = swipe right (go to previous page); swipe(350,437,50,437) = swipe left (go to next page). All coordinates in 402×874pt space.
+9. DIALOGS: Handle system dialogs first. Dismiss unless task needs that permission.
+10. DEAD-END: Same action repeated → go BACK or try new path.
+11. Screen: iPhone 16 Pro 402×874. Top-left origin. Status bar y<55.
+12. If you cannot find the target in the image, use ground("query"); otherwise decide from the screenshot.
 
-1. DONE DETECTION (check this FIRST every step):
-   - If elements list includes a Heading or NavigationBar whose label matches the task target → you are ALREADY on that screen → output done.
-   - Example: task "打開設定", elements show [Heading] "Settings" → {"action_type":"done","result":"Settings is open."}
-   - Example: task "open Wi-Fi", elements show [NavigationBar] "Wi-Fi" → done.
-   - The word "Application" type elements are just the app container — NOT a sign you should tap again.
-
-2. ELEMENTS LIST: When accessibility elements are provided, pick the BUTTON/CELL that navigates toward the target.
-   Match semantically: task "設定"→"Settings", "錢包"→"Wallet", "相片"→"Photos".
-   Tasks may be in Chinese; labels are usually English — you bridge them.
-   ONLY tap elements of type Button, Cell, or similar interactive types — NOT Heading/Application.
-
-3. Use "done" ONLY with CLEAR VISUAL PROOF. NEVER assume done if screen looks identical to the previous step.
-
-4. Coordinate origin is top-left. iPhone 16 Pro logical screen: 402×874.
-   Status bar: y<55. Home indicator: y>820.
-
-5. NAVIGATION: Use press_key(BACK) to go up one level, press_key(HOME) to return home.
-
-6. SCROLLING: When the target is NOT visible in the elements list but the off-screen section
-   shows elements below/above, scroll to reveal them before tapping.
-   - "has_content_below=True" → scroll down with swipe(201,700,201,200)
-   - "has_content_above=True" → scroll up with swipe(201,200,201,700)
-   - Off-screen elements in the list show their label — if target is there, scroll toward it.
-
-7. DEAD-END: If same action repeated with no progress → go BACK or try a new path.
-
-7. SYSTEM DIALOGS: If "Active dialog" is shown, handle it FIRST. Dismiss unless task needs the permission.
-
-EXAMPLE (home screen, task "打開設定"):
-Elements: "Settings" Button cx=337, cy=425
-→ {"action_type":"tap","x":337,"y":425,"reasoning":"Settings Button on home screen."}
-
-EXAMPLE (Settings is now open, task "打開設定"):
-Elements include [Heading] "Settings" at cx=82, cy=124
-→ {"action_type":"done","result":"Settings app is open.","reasoning":"Heading shows Settings — already on target screen."}
-
-REMINDER: Output ONLY the JSON. Nothing else."""
+Output ONLY the JSON. No explanation."""
 
 
 def build_user_message(
@@ -95,25 +50,40 @@ def build_user_message(
     ground_query: "str | None" = None,
     scroll_info: "dict | None" = None,
     keyboard_open: bool = False,
+    screenshot_url: "str | None" = None,
+    foreground_app: "dict | None" = None,
 ) -> list[dict]:
     """
-    Build the user message content list for the OpenAI Vision API.
+    Build the user message content for the Vision API: image (screenshot) + text context.
 
-    ui_elements: accessibility elements from the current screen (label, type, cx, cy).
-    grounding_result: if set, this is phase-2 — Qwen must pick a direct action.
-    ground_query: the query Qwen issued; shown in phase-2 context.
+    Prefer screenshot_url (binary fetch) over screenshot_data_url (base64) to avoid
+    large request bodies and extra encoding. Qwen sees the screenshot first (universal).
+    foreground_app from MDB (idb list-apps) helps done detection: e.g. task 打開 files app
+    + foreground_app bundle_id is com.apple.DocumentsApp → we're in Files → done.
     """
     parts: list[dict] = []
 
-    # Screenshot always first
-    parts.append({
-        "type": "image_url",
-        "image_url": {"url": screenshot_data_url, "detail": "high"},
-    })
+    # Vision-first: send screenshot so Qwen can see the screen.
+    # Prefer URL (server fetches binary) over data URL (base64 in body).
+    image_url = screenshot_url if screenshot_url else (
+        screenshot_data_url if (screenshot_data_url and screenshot_data_url.startswith("data:")) else None
+    )
+    if image_url:
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": image_url},
+        })
 
     lines: list[str] = [
         f"Step {step}/{max_steps}  |  Task: {task}",
     ]
+
+    # ── Foreground app (from MDB: idb list-apps process_state=Running) ─────────
+    if foreground_app:
+        bid = foreground_app.get("bundle_id", "")
+        name = foreground_app.get("name", "")
+        lines.append(f"\nCurrent foreground app: {bid} ({name})")
+        lines.append("  Use this to decide done: e.g. task 打開 files app + foreground is Files app → done.")
 
     # ── Active dialog (highest priority context) ───────────────────────────────
     if dialog_info:
@@ -173,7 +143,12 @@ def build_user_message(
     if history:
         lines.append("\nLast actions:")
         for h in history[-4:]:
-            lines.append(f"  step {h.get('step','?')}: {h.get('action','?')}")
+            line = f"  step {h.get('step','?')}: {h.get('action','?')}"
+            if h.get("screen_after"):
+                line += f" → screen: [{h['screen_after']}]"
+            if h.get("error"):
+                line += f" ⚠ ERROR: {h['error']}"
+            lines.append(line)
 
     # ── Phase-2: picking from provided elements ────────────────────────────────
     if grounding_result is not None:
@@ -250,6 +225,18 @@ def build_user_message(
                 cy    = el.get("cy", 0)
                 direction = "↓ below" if cy > 874 else "↑ above"
                 lines.append(f"  {label:<30} | {etype:<14} | {direction} viewport")
+
+        # Hint when elements clearly indicate in-app (Tab Bar + No Recents / Application)
+        labels_lower = " ".join(el.get("label", "") for el in visible).lower()
+        has_tab_bar = "tab bar" in labels_lower
+        has_in_app = "no recents" in labels_lower or "application" in labels_lower
+        task_lower = task.lower()
+        open_app_task = "打開" in task or "open" in task_lower
+        if has_tab_bar and has_in_app and open_app_task:
+            lines.append(
+                "\n→ IN-APP: Elements show Tab Bar and in-app UI (No Recents / Application). "
+                "You are INSIDE the app, not on home screen. If task is to open this app → output done."
+            )
 
         lines.append(
             "\nMatch task semantically to labels (Chinese→English). "

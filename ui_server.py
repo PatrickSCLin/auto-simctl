@@ -2,9 +2,11 @@
 UI-UG-7B HTTP Server — keeps the model loaded in memory as a long-running service.
 
 Endpoints:
-    POST /grounding   { image_base64: str }              -> { elements: [...] }
-    POST /referring   { image_base64: str, bbox: [int] } -> { description: str }
-    GET  /health                                          -> { status: "ok", model: str }
+    POST /grounding   { image_base64?: str, image_url?: str }  -> { elements: [...] }
+    POST /referring   { image_base64?: str, image_url?: str, bbox: [int] } -> { description: str }
+    GET  /health      -> { status: "ok", model: str }
+
+    Prefer image_url (server fetches binary) over image_base64 to avoid large request bodies.
 
 Usage:
     python3 ui_server.py                         # default port 8081
@@ -19,6 +21,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -112,12 +115,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": "Model not loaded yet"})
             return
 
-        img_b64 = body.get("image_base64", "")
-        try:
-            image_bytes = base64.b64decode(img_b64)
-        except Exception as e:
-            self._send_json(400, {"error": f"Invalid base64: {e}"})
-            return
+        # Prefer image_url (fetch binary) over image_base64
+        image_url = body.get("image_url")
+        if image_url:
+            try:
+                with urllib.request.urlopen(image_url, timeout=30) as r:
+                    image_bytes = r.read()
+            except Exception as e:
+                self._send_json(400, {"error": f"Failed to fetch image_url: {e}"})
+                return
+        else:
+            img_b64 = body.get("image_base64", "")
+            try:
+                image_bytes = base64.b64decode(img_b64)
+            except Exception as e:
+                self._send_json(400, {"error": f"Invalid base64: {e}"})
+                return
 
         if self.path == "/grounding":
             query = body.get("query", "").strip()

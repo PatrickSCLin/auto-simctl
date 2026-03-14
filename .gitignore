@@ -89,3 +89,6 @@ temp/
 
 # idb / adb artifacts
 *.dSYM/
+
+# Runtime pid files
+*.pid

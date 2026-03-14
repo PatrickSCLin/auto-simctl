@@ -398,7 +398,7 @@ def _start_proc(
 @server_app.command("start")
 def server_start(
     qwen_model: str = typer.Option(
-        str(Path.home() / ".cache/huggingface/hub/qwen3.5-2b-mlx-4bit"),
+        str(Path.home() / ".cache/huggingface/hub/qwen3.5-9b-mlx-4bit"),
         "--qwen-model", help="Qwen model path",
     ),
     uiug_model: str = typer.Option(
@@ -426,7 +426,7 @@ def server_start(
         _start_proc(
             [str(server_bin), "launch",
              "--model-path", qwen_model,
-             "--model-type", "multimodal",
+             "--model-type", "multimodal",  # VLM: Qwen sees screenshot
              "--port", str(qwen_port),
              "--host", "127.0.0.1",
              "--max-tokens", "4096"],
@@ -434,7 +434,7 @@ def server_start(
             pid_file=_QWEN_PID_FILE,
         )
         with console.status("[cyan]Waiting for Qwen server…[/cyan]"):
-            deadline = time.time() + 60
+            deadline = time.time() + 120
             while time.time() < deadline:
                 if qwen.server_running():
                     break
@@ -480,6 +480,33 @@ def server_start(
     if verbose:
         rprint()
         _stream_logs(follow=True)
+
+
+@server_app.command("restart")
+def server_restart(
+    qwen_model: str = typer.Option(
+        str(Path.home() / ".cache/huggingface/hub/qwen3.5-9b-mlx-4bit"),
+        "--qwen-model", help="Qwen model path",
+    ),
+    uiug_model: str = typer.Option(
+        str(Path.home() / ".cache/huggingface/hub/ui-ug-7b-2601-4bit"),
+        "--uiug-model", help="UI-UG model path",
+    ),
+    qwen_port: int = typer.Option(8080, "--qwen-port"),
+    uiug_port: int = typer.Option(8081, "--uiug-port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v",
+                                 help="Stream server logs after starting"),
+):
+    """Stop both servers, then start them again (same as stop + start)."""
+    server_stop()
+    time.sleep(2)  # let ports release
+    server_start(
+        qwen_model=qwen_model,
+        uiug_model=uiug_model,
+        qwen_port=qwen_port,
+        uiug_port=uiug_port,
+        verbose=verbose,
+    )
 
 
 @server_app.command("stop")

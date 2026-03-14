@@ -10,22 +10,25 @@ Close the vibe coding feedback gap: AI agent reads a task, takes screenshots fro
 
 ## Current Status
 
-| Area                        | Status     | Notes                                              |
-|-----------------------------|------------|----------------------------------------------------|
-| MDB unified bridge          | ✅ Done     | `adb` + `idb`, all core actions                   |
-| iOS accessibility tree      | ✅ Done     | `list_elements()`, `get_scroll_info()`             |
-| Qwen-as-director            | ✅ Done     | Phase-1 + Phase-2 reasoning loop                  |
-| Navigation stack            | ✅ Done     | `NavFrame` + `ScrollState` per frame               |
-| Scroll awareness            | ✅ Done     | off-screen element detection, scroll recipes       |
-| System dialog detection     | ✅ Done     | auto-dismiss permission / alert dialogs            |
-| Keyboard detection          | ✅ Done     | `input_text()` triggered when keyboard is open     |
-| Dead-end detection          | ✅ Done     | same action 3× → force HOME                        |
-| Semantic language bridging  | ✅ Done     | Qwen maps Chinese task → English labels, no tables |
-| UI-UG server                | ✅ Done     | background HTTP on `:8081`, fallback only          |
-| Server management CLI       | ✅ Done     | `cli.py server start/stop/status`                  |
-| Task cancellation           | ✅ Done     | new task cancels previous in-flight run            |
-| MCP server                  | 🔲 Future  | FastMCP skeleton exists                            |
-| Android backend             | 🔲 Partial | structure complete, not battle-tested              |
+| Area                        | Status     | Notes                                                          |
+|-----------------------------|------------|----------------------------------------------------------------|
+| MDB unified bridge          | ✅ Done     | `adb` + `idb`, all core actions; coordinate clamping          |
+| iOS accessibility tree      | ✅ Done     | `list_elements()`, `get_scroll_info()`                        |
+| Qwen-as-director            | ✅ Done     | Adaptive thinking; phase-1 + phase-2 reasoning loop           |
+| Navigation stack            | ✅ Done     | `NavFrame` + `ScrollState` per frame                          |
+| Scroll awareness            | ✅ Done     | off-screen element detection, scroll recipes                   |
+| System dialog detection     | ✅ Done     | auto-dismiss permission / alert dialogs                        |
+| Keyboard detection          | ✅ Done     | `input_text()` triggered when keyboard is open                |
+| Dead-end detection          | ✅ Done     | same action 3× → force HOME                                   |
+| Semantic language bridging  | ✅ Done     | Qwen maps Chinese task → English labels, no tables            |
+| Fast-paths (no Qwen)        | ✅ Done     | app icon visible / in-app elements / foreground match → done  |
+| Pre-flight home reset       | ✅ Done     | HOME + Today View detection → swipe to page 0                 |
+| Adaptive thinking mode      | ✅ Done     | `_needs_thinking()` heuristic; currently always-on for 9B     |
+| UI-UG server                | ✅ Done     | background HTTP on `:8081`, fallback only                     |
+| Server management CLI       | ✅ Done     | `cli.py server start/stop/status`                             |
+| Task cancellation           | ✅ Done     | new task cancels previous in-flight run                       |
+| MCP server                  | 🔲 Future  | FastMCP skeleton exists                                        |
+| Android backend             | 🔲 Partial | structure complete, not battle-tested                          |
 
 ---
 
@@ -37,7 +40,9 @@ flowchart TD
     CLI --> Orchestrator
 
     subgraph Orchestrator["Orchestrator (ReAct Loop)"]
-        loop["Step Loop (max N steps)\n1. Screenshot\n2. list_elements + scroll_info\n3. Detect dialog / keyboard\n4. Qwen phase-1 → action\n5. [opt] Qwen phase-2 → direct action\n6. Execute via MDB\n7. Update NavFrame + ScrollState"]
+        preflight["Pre-flight\n1. HOME if not on SpringBoard\n2. Swipe left if on Today View"]
+        loop["Step Loop (max N steps)\n1. Screenshot\n2. list_elements + scroll_info\n3. Detect dialog / keyboard\n4. Fast-paths (no Qwen)\n   a. done: in-app elements match\n   b. tap: app icon visible in elements\n5. Qwen phase-1 → action\n6. [opt] Qwen phase-2 → direct action\n7. Clamp + snap coords → execute\n8. Update NavFrame + ScrollState"]
+        preflight --> loop
     end
 
     Orchestrator -->|"screenshot"| MDB
@@ -45,12 +50,11 @@ flowchart TD
     QwenAgent -->|"action or ground query"| Orchestrator
     Orchestrator -->|"ground query (last resort)"| UIAgent
     UIAgent -->|"visual bboxes + labels"| Orchestrator
-    QwenAgent -->|"direct action"| MDB
     MDB -->|"executed"| Orchestrator
     Orchestrator -->|"TaskResult"| User
 
     subgraph MDB["MDB — Mobile Device Bridge"]
-        Bridge["bridge.py\n(unified API + coord conversion)"]
+        Bridge["bridge.py\n(unified API + coord clamping)"]
         Screen["screen.py\n(ScreenSpec)"]
         ADB["adb_backend.py\n(Android)"]
         IDB["idb_backend.py\n(iOS Simulator)"]
@@ -64,7 +68,7 @@ flowchart TD
     end
 
     subgraph QwenAgent["agents/qwen_agent.py"]
-        MLXServer["mlx-openai-server :8080\n(qwen3.5-2b-mlx-4bit)"]
+        MLXServer["mlx-openai-server :8080\n(qwen3.5-9b-mlx-4bit)"]
         OpenAIClient["openai Python client"]
         MLXServer --> OpenAIClient
     end
@@ -91,7 +95,7 @@ auto-simctl/
 ├── logger.py                      # structured logging
 │
 ├── mdb/                           # Mobile Device Bridge
-│   ├── bridge.py                  # DeviceBridge unified API + coord conversion
+│   ├── bridge.py                  # DeviceBridge unified API + coord conversion + clamping
 │   ├── screen.py                  # ScreenSpec: pixel ↔ pt ↔ norm1000
 │   ├── models.py                  # DeviceInfo, Action, Screenshot, UIElement
 │   └── backends/
@@ -99,12 +103,12 @@ auto-simctl/
 │       └── adb_backend.py         # Android: same interface via adb
 │
 ├── agents/
-│   ├── qwen_agent.py              # Qwen3.5-2B reasoning (phase-1 + phase-2)
+│   ├── qwen_agent.py              # Qwen3.5-9B reasoning; adaptive thinking mode
 │   ├── ui_agent.py                # UI-UG-7B-2601 client → ui_server.py
 │   └── prompts.py                 # SYSTEM_PROMPT + build_user_message
 │
 ├── orchestrator/
-│   ├── loop.py                    # ReAct loop, nav stack, dead-end detection
+│   ├── loop.py                    # ReAct loop, pre-flight, fast-paths, nav stack
 │   └── result.py                  # TaskResult, StepLog, NavFrame, ScrollState
 │
 ├── mcp_server/
@@ -159,7 +163,10 @@ When a new `run` command arrives while a task is in flight, the previous task is
 | `get_scroll_info(udid)`         | Scroll boundary flags + total content size                |
 | `detect_system_dialog(udid)`    | Detect system alert/permission dialog overlay             |
 | `find_element_by_label(udid, kw)` | Fast accessibility label lookup                         |
-| `execute(udid, action)`         | Dispatch any `Action` object; auto-converts norm1000 coords |
+| `get_foreground_app(udid)`      | Running foreground app bundle ID + name via idb           |
+| `execute(udid, action)`         | Dispatch any `Action`; auto-converts norm1000; clamps coords to screen bounds |
+
+**Coordinate clamping in `execute()`**: All tap/swipe coordinates are clamped to `[0, pt_w] × [0, pt_h]` before sending to idb. This prevents out-of-bounds coordinates (e.g. LLM hallucination at x=850 on a 402pt screen) from silently failing.
 
 **`screen.py`** — `ScreenSpec` manages three coordinate spaces:
 
@@ -175,17 +182,27 @@ Conversion: `pt = round(norm * device_pts / 1000)`. Scale factor inferred from d
 
 - **`list_elements()`**: Runs `idb ui describe-all`, parses the JSON accessibility tree, returns flat list with `{label, type, cx, cy, x, y, width, height, visible}`. `visible=True` if element center is within screen bounds. Sorted top-to-bottom, left-to-right (reading order).
 - **`get_scroll_info()`**: Computes `has_content_above/below/left/right` by checking element cy/cx values against screen bounds. Returns estimated `content_height_pt` / `content_width_pt`.
+- **`get_foreground_app()`**: Calls `idb list-apps --fetch-process-state`, returns the app with `process_state=Running` (may be stale; always cross-check with elements).
 - **`detect_system_dialog()`**: Walks the accessibility tree looking for modal alert/permission overlays. Guards against false positives:
   - **Keyboard guard**: any single-letter Button → not a dialog (it's the software keyboard)
   - **Max-button guard**: more than 4 buttons → not a dialog (it's a list/toolbar)
   - **Meaningful text guard**: dialog must have real message text (question sentence or permission keyword)
-  - `"continue"` removed from `_ALERT_WORDS` (too common in non-dialog contexts)
 
 ---
 
 ### 3. `agents/qwen_agent.py` — Reasoning Engine
 
-Calls `qwen3.5-2b-mlx-4bit` via local `mlx-openai-server` (OpenAI-compatible API at `:8080`).
+Calls `qwen3.5-9b-mlx-4bit` via local `mlx-openai-server` (OpenAI-compatible API at `:8080`).
+
+**Adaptive thinking mode** (`_needs_thinking(task)`):
+
+The model supports `enable_thinking` (chain-of-thought `<think>` tokens). Thinking adds 8–30s per call but improves accuracy on complex tasks. Currently always enabled (`True`) because the 9B model generates invalid coordinates without thinking. The function exists as a hook for future lighter-weight models.
+
+```python
+# Future: return False for simple tasks when model is reliable without CoT
+def _needs_thinking(task: str) -> bool:
+    return True  # always think for now
+```
 
 **Two-phase reasoning loop:**
 
@@ -198,39 +215,119 @@ Calls `qwen3.5-2b-mlx-4bit` via local `mlx-openai-server` (OpenAI-compatible API
 2. If accessibility is empty (custom canvas / game view) → call UI-UG-7B visual grounding → pass bboxes to Qwen phase-2
 
 **Inputs to `decide()`:**
-- `task`, `screenshot_data_url` (base64 PNG), `ui_elements`, `history`
+- `task`, `screenshot_url` (preferred; server fetches binary), `ui_elements`, `history`
 - `nav_stack` (navigation breadcrumbs), `dialog_info`, `scroll_info`
-- `keyboard_open` (bool) — triggers `input_text` guidance in the prompt
+- `keyboard_open` (bool), `foreground_app` (from MDB)
 
 ---
 
 ### 4. `agents/prompts.py` — System Prompt & Context
 
-**`SYSTEM_PROMPT`** rules (evaluated in order every step):
+**`SYSTEM_PROMPT`** key rules:
 
-| Rule | Name                | Description                                                             |
-|------|---------------------|-------------------------------------------------------------------------|
-| 0    | Keyboard / Text     | If keyboard open → `input_text()`, never tap individual keys            |
-| 1    | Done detection      | If Heading/NavigationBar label matches task target → `done`             |
-| 2    | Element matching    | Tap Button/Cell semantically matching the target; bridge Chinese→English |
-| 3    | Done requirements   | Must have clear visual proof; never assume done if screen unchanged     |
-| 4    | Coordinates         | Origin top-left; iPhone 16 Pro logical screen 402×874pt                 |
-| 5    | Navigation          | BACK = up one level; HOME = return to launcher                          |
-| 6    | Scrolling           | `has_content_below` → `swipe(201,700,201,200)`; off-screen elements guide direction |
-| 7    | Dead-end            | Same action repeated → go BACK or try a different path                  |
+| Rule | Name                    | Description                                                                      |
+|------|-------------------------|----------------------------------------------------------------------------------|
+| 1    | Elements = IN-APP       | Tab Bar + No Recents/Application in elements → inside app, NOT home screen       |
+| 2    | Foreground + in-app     | MDB foreground matches task + elements show in-app UI → done                    |
+| 3    | Image second            | Screenshot confirms, elements table is authoritative for coordinates             |
+| 4    | Done (generic)          | Screen/elements clearly show task result → done                                  |
+| 5    | Tap coords              | ALWAYS use (cx,cy) from elements table; NEVER estimate from screenshot           |
+| 6    | Language bridge         | 設定→Settings, 檔案→Files, 相片→Photos                                            |
+| 7    | Keyboard               | Keyboard open → `input_text()`, never tap letter keys                           |
+| 8    | Scroll + page swipe     | Vertical: `swipe(201,700,201,200)` = down. Horizontal: `swipe(350,437,50,437)` = swipe left (next page) |
+| 9    | Dialogs                 | Handle system dialogs first                                                       |
+| 10   | Dead-end                | Same action 3× → BACK or HOME                                                   |
+| 11   | Screen bounds           | iPhone 16 Pro 402×874pt, top-left origin                                         |
+| 12   | Ground fallback         | Can't find target → `ground("query")`                                            |
 
 **`build_user_message()`** injects per-step context:
 - Active dialog (highest priority — handle first)
-- Keyboard banner (`⌨️ KEYBOARD IS OPEN — use input_text()`)
+- Foreground app from MDB (bundle ID + name)
 - Navigation breadcrumbs with scroll offsets
-- Scroll boundary summary
 - Recent action history (last 4 steps)
 - Visible elements table (label, type, tap coords) — keyboard keys filtered out
 - Off-screen elements table (direction from viewport)
+- **In-app hint**: injected when elements show Tab Bar + No Recents + open-app task
 
 ---
 
-### 5. `orchestrator/result.py` — State Dataclasses
+### 5. `orchestrator/loop.py` — ReAct Control Loop
+
+#### Pre-flight
+
+Before the step loop, ensures we start from the MAIN home screen page:
+
+```
+1. Check if SpringBoard is foreground (idb foreground app)
+   → if not: press HOME, wait 0.9s
+2. Check if on main home page:
+   - Main home: ≤12 visible elements AND has Button-type elements (app icons)
+   - Today View: 13+ elements (widgets) — also has dock so label-only check fails
+   → if not: swipe LEFT (350→50) to go from Today View to page 0, wait 0.6s
+3. Retry checks up to 2 more times if still not on main home
+```
+
+#### Step loop
+
+```
+while step <= max_steps:
+    shot = mdb.screenshot(device)
+    acc_elements = mdb.list_elements(device)
+    keyboard_open = any single-letter Button in acc_elements
+    scroll_info = mdb.get_scroll_info(device)
+    dialog = mdb.detect_system_dialog(device)
+    if dialog: auto_dismiss(dialog); continue
+
+    foreground_app = mdb.get_foreground_app(device)
+
+    # Fast-paths: check before calling Qwen
+    action = _open_app_done_if_foreground(task, foreground_app, acc_elements)
+             ?? _open_app_tap_if_visible(task, acc_elements)
+             ?? qwen.decide(task, shot, acc_elements, ...)
+
+    # Ground loop (if Qwen emitted ground())
+    if action == ground:
+        if acc_elements: action = qwen.decide(..., grounding_result=acc_elements)
+        else: visual = ui_agent.ground(shot, query)
+              action = qwen.decide(..., grounding_result=visual)
+
+    # Snap out-of-bounds taps to nearest element
+    if action.tap and (x > 402 or y > 874): snap to nearest visible element
+
+    if action == done: break
+
+    mdb.execute(action)  # clamps coords to screen bounds internally
+
+    # Update navigation stack
+    if is_navigation_action(action):  nav_stack.push(NavFrame(...))
+    elif is_scroll(action):           nav_stack[-1].scroll.update(dy, scroll_info)
+    elif action == BACK:              nav_stack.pop()
+    elif action == HOME:              nav_stack.clear()
+
+    # Dead-end detection
+    if same action 3×: force press_key(HOME)
+
+return TaskResult(success, steps, logs)
+```
+
+#### Fast-paths (no Qwen, checked every step after elements are loaded)
+
+| Fast-path | Trigger | Action |
+|-----------|---------|--------|
+| `_open_app_done_from_elements` | task = "打開 X app" + elements have Tab Bar + No Recents + X label | → `done` |
+| `_open_app_done_if_foreground` | MDB foreground = X + elements show in-app (Tab Bar + No Recents) | → `done` |
+| `_open_app_tap_if_visible` | task = "打開 X app" + X Button visible in elements | → `tap(cx, cy)`, skip Qwen |
+
+The foreground-only check is intentionally rejected — `idb list-apps` process state can be stale (app was last open but SpringBoard is current). Elements are the ground truth.
+
+#### `_swipe_direction(action)` classifies swipes:
+- `scroll_down` / `scroll_up`: vertical swipe → updates `ScrollState`, stays on same `NavFrame`
+- `scroll_left` / `scroll_right`: short horizontal swipe → updates `scroll_x`
+- `navigate`: large horizontal swipe (>150pt) → pushes new `NavFrame`
+
+---
+
+### 6. `orchestrator/result.py` — State Dataclasses
 
 ```python
 @dataclass
@@ -265,50 +362,6 @@ class TaskResult:
 
 ---
 
-### 6. `orchestrator/loop.py` — ReAct Control Loop
-
-```
-while step <= max_steps:
-    shot = mdb.screenshot(device)
-    acc_elements = mdb.list_elements(device)
-    keyboard_open = any single-letter Button in acc_elements
-    scroll_info = mdb.get_scroll_info(device)  [if not keyboard_open]
-    dialog = mdb.detect_system_dialog(device)
-    if dialog:
-        auto_dismiss(dialog)
-        continue  # re-screenshot next step
-
-    action = qwen.decide(task, shot, acc_elements, ..., keyboard_open, scroll_info)
-
-    if action.type == "ground":
-        if acc_elements:
-            action = qwen.decide(..., grounding_result=acc_elements)  # phase-2
-        else:
-            visual = ui_agent.ground(shot, query)
-            action = qwen.decide(..., grounding_result=visual)         # phase-2
-
-    if action.type == "done":  break
-    mdb.execute(action)
-
-    # Update navigation stack
-    if is_navigation_action(action):    nav_stack.push(NavFrame(...))
-    elif is_scroll_swipe(action):       nav_stack[-1].scroll.update(dy, scroll_info)
-    elif action == BACK:                nav_stack.pop(); reset scroll
-    elif action == HOME:                nav_stack.clear()
-
-    # Dead-end detection
-    if same action 3×: force press_key(HOME)
-
-return TaskResult(success, steps, logs)
-```
-
-**`_swipe_direction(action)`** classifies swipes:
-- `scroll_down` / `scroll_up`: short vertical swipe → updates `ScrollState`, stays on same `NavFrame`
-- `scroll_left` / `scroll_right`: short horizontal swipe → updates `scroll_x`
-- `navigate`: large horizontal swipe → pushes new `NavFrame`
-
----
-
 ### 7. `ui_server.py` — UI-UG-7B HTTP Server
 
 Loads `neovateai/UI-UG-7B-2601` (4-bit quantized) via `mlx-vlm` and serves it on `:8081`.
@@ -335,7 +388,7 @@ Used only as **fallback** when accessibility tree is empty (custom-drawn views, 
 
 iPhone 16 Pro: `@3.0x` scale → pixel = pt × 3. `ScreenSpec` handles all conversions, using screenshot dimensions as ground truth.
 
-**Action coordinates**: Qwen always outputs logical points (pt space). UI-UG outputs norm1000, which `DeviceBridge.execute()` auto-converts when `action._from_grounding` is set.
+**Action coordinates**: Accessibility elements already carry `(cx, cy)` in logical points — Qwen should always use these. UI-UG outputs norm1000, which `DeviceBridge.execute()` auto-converts. All coordinates are clamped to screen bounds before execution.
 
 ---
 
@@ -343,10 +396,10 @@ iPhone 16 Pro: `@3.0x` scale → pixel = pt × 3. `ScreenSpec` handles all conve
 
 | Model                   | Role                                                | Inference           | Port  |
 |-------------------------|-----------------------------------------------------|---------------------|-------|
-| `qwen3.5-2b-mlx-4bit`  | Reasoning: task understanding, action planning, semantic language bridging, done detection | `mlx-openai-server` | 8080 |
+| `qwen3.5-9b-mlx-4bit`  | Reasoning: task understanding, action planning, semantic language bridging, done detection | `mlx-openai-server` | 8080 |
 | `UI-UG-7B-2601`         | Vision fallback: visual element grounding for custom views | `mlx-vlm` via `ui_server.py` | 8081 |
 
-Qwen does **not** need UI-UG for standard iOS apps — the accessibility tree provides accurate element labels and coordinates in logical points. UI-UG is reserved for UIs without accessibility support.
+**Why accessibility-first**: Qwen does not need to estimate coordinates from the screenshot for standard iOS apps. The accessibility tree provides `(cx, cy)` in logical points for every element. Qwen's role is semantic: decide WHICH element to act on, not WHERE it is. UI-UG is reserved for UIs without accessibility support (games, canvas, WebView).
 
 **Semantic language bridging**: Qwen natively maps Chinese task descriptions to English UI labels. No hardcoded translation tables exist anywhere in the codebase — this is an intentional design decision. Qwen reasons over the raw labels it receives.
 
@@ -371,11 +424,11 @@ Qwen does **not** need UI-UG for standard iOS apps — the accessibility tree pr
 {
   "success": true,
   "steps_taken": 3,
-  "conclusion": "Settings app is open.",
+  "conclusion": "Files app is open.",
   "blocked_reason": null,
   "evidence": [
-    {"step": 1, "action": "tap(337, 425)", "ui_elements_count": 13},
-    {"step": 2, "action": "done", "ui_elements_count": 8}
+    {"step": 1, "action": "tap(337, 131)", "ui_elements_count": 8},
+    {"step": 2, "action": "done", "ui_elements_count": 4}
   ]
 }
 ```
@@ -388,4 +441,5 @@ Qwen does **not** need UI-UG for standard iOS apps — the accessibility tree pr
 - **UI-UG accuracy**: Coordinates from visual grounding are sometimes inaccurate on iOS; accessibility tree is always preferred.
 - **Multi-device**: Currently single-device per run; parallel runs not supported.
 - **MCP server**: Skeleton only — not connected to the orchestrator yet.
+- **Thinking budget**: `enable_thinking=True` is required for 9B model accuracy but adds 10–30s per step. A lighter model or per-task budget would help.
 - **Model upgrades**: Architecture supports any OpenAI-compatible model at `:8080`; Qwen model path is configurable.

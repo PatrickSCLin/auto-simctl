@@ -152,6 +152,16 @@ class DeviceBridge:
     def launch_app(self, udid: str, app_id: str) -> None:
         self._backend(udid).launch_app(udid, app_id)
 
+    def open_url(self, udid: str, url: str) -> None:
+        backend = self._backend(udid)
+        if hasattr(backend, "open_url"):
+            backend.open_url(udid, url)
+
+    def approve_permissions(self, udid: str, bundle_id: str, permissions: list[str]) -> None:
+        backend = self._backend(udid)
+        if hasattr(backend, "approve_permissions"):
+            backend.approve_permissions(udid, bundle_id, permissions)
+
     def dump_ui(self, udid: str) -> str:
         """Return raw accessibility/UI hierarchy as string (XML for Android, JSON for iOS)."""
         return self._backend(udid).dump_ui(udid)
@@ -203,6 +213,21 @@ class DeviceBridge:
             return backend.find_element_by_label(udid, keyword)
         return None
 
+    def get_foreground_app(self, udid: str) -> Optional[dict]:
+        """
+        Return the current foreground app (iOS only).
+
+        Uses idb list-apps --fetch-process-state; returns the app with
+        process_state "Running". Helps Qwen know "we're in X app" for done detection.
+
+        Returns:
+            {"bundle_id": str, "name": str} or None if unavailable / Android.
+        """
+        backend = self._backend(udid)
+        if hasattr(backend, "get_foreground_app"):
+            return backend.get_foreground_app(udid)
+        return None
+
     # ── Action dispatcher ──────────────────────────────────────────────────────
 
     def execute(self, udid: str, action: Action) -> None:
@@ -233,12 +258,22 @@ class DeviceBridge:
                 return self._norm1000_to_pt(udid, nx, ny)
             return nx, ny
 
+        # Clamp helper: ensure coordinates stay within the device logical screen.
+        def _clamp(x: int, y: int) -> tuple[int, int]:
+            spec = self._screen_spec(udid)
+            w = spec.pt_w or 402
+            h = spec.pt_h or 874
+            return max(0, min(x, w)), max(0, min(y, h))
+
         if action.action_type == "tap":
             x, y = _resolve(action.x, action.y)
+            x, y = _clamp(x, y)
             self.tap(udid, x, y)
         elif action.action_type == "swipe":
             x1, y1 = _resolve(action.x, action.y)
             x2, y2 = _resolve(action.x2, action.y2)
+            x1, y1 = _clamp(x1, y1)
+            x2, y2 = _clamp(x2, y2)
             self.swipe(udid, x1, y1, x2, y2, action.duration_ms)
         elif action.action_type == "input_text":
             self.input_text(udid, action.text)

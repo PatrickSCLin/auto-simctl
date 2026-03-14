@@ -122,7 +122,18 @@ class IdbBackend:
              "--duration", str(duration_s), udid=udid)
 
     def input_text(self, udid: str, text: str) -> None:
-        _idb("ui", "text", text, udid=udid)
+        """Type text. Uses idb for ASCII, falls back to pasteboard for Unicode."""
+        if text.isascii():
+            _idb("ui", "text", text, udid=udid)
+        else:
+            # idb ui text doesn't support Unicode — inject via simctl pasteboard
+            import subprocess as _sp
+            _sp.run(
+                ["xcrun", "simctl", "pbcopy", udid],
+                input=text.encode("utf-8"), check=True,
+            )
+            # Simulate Cmd+V paste
+            _idb("ui", "key", "47", "--modifier", "command", udid=udid, check=False)
 
     def press_key(self, udid: str, key: str) -> None:
         normalized = _KEY_MAP.get(key.upper(), key.upper())
@@ -132,7 +143,67 @@ class IdbBackend:
             _idb("ui", "key", normalized, udid=udid)
 
     def launch_app(self, udid: str, bundle_id: str) -> None:
-        _idb("launch", bundle_id, udid=udid)
+        """Launch app by bundle ID. If it looks like a URL/scheme, use open_url."""
+        if "://" in bundle_id or (":" in bundle_id and not bundle_id.startswith("com.")):
+            self.open_url(udid, bundle_id)
+        else:
+            _idb("launch", bundle_id, udid=udid)
+
+    def get_foreground_app(self, udid: str) -> Optional[dict]:
+        """
+        Return the current foreground (running) app's bundle_id and name.
+
+        Uses `idb list-apps --json --fetch-process-state` and returns the first
+        app with process_state == "Running". On home screen this is often
+        SpringBoard; when an app is open, that app is Running.
+
+        Returns:
+            {"bundle_id": str, "name": str} or None if unavailable.
+        """
+        result = _idb(
+            "list-apps", "--json", "--fetch-process-state",
+            udid=udid, check=False, timeout=15,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        try:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                app = json.loads(line)
+                if app.get("process_state") == "Running":
+                    return {
+                        "bundle_id": app.get("bundle_id", ""),
+                        "name": app.get("name", ""),
+                    }
+        except Exception:
+            pass
+        return None
+
+    def open_url(self, udid: str, url: str) -> None:
+        """
+        Open a URL or custom scheme via xcrun simctl openurl.
+        Falls back to idb open if simctl fails.
+        """
+        result = subprocess.run(
+            ["xcrun", "simctl", "openurl", udid, url],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            # Fallback to idb
+            _idb("open", url, udid=udid, check=False)
+
+    def approve_permissions(self, udid: str, bundle_id: str, permissions: list[str]) -> None:
+        """
+        Pre-approve system permissions for an app.
+        Supported: photos, camera, contacts, location, etc.
+        """
+        for perm in permissions:
+            try:
+                _idb("approve", bundle_id, perm, udid=udid, check=False)
+            except Exception:
+                pass
 
     # ── UI dump ────────────────────────────────────────────────────────────────
 

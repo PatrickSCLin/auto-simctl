@@ -73,44 +73,70 @@ class UIAgent:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def grounding(self, png_bytes: bytes) -> list[UIElement]:
-        """List ALL visible UI elements (no specific query)."""
-        return self._grounding_call(png_bytes, query=None)
+    def grounding(
+        self,
+        png_bytes: bytes,
+        screenshot_url: Optional[str] = None,
+    ) -> list[UIElement]:
+        """List ALL visible UI elements (no specific query). Prefer screenshot_url over base64."""
+        return self._grounding_call(png_bytes, query=None, screenshot_url=screenshot_url)
 
-    def grounding_targeted(self, png_bytes: bytes, query: str) -> list[UIElement]:
+    def grounding_targeted(
+        self,
+        png_bytes: bytes,
+        query: str,
+        screenshot_url: Optional[str] = None,
+    ) -> list[UIElement]:
         """
         Find a SPECIFIC element by description.
-        Called by orchestrator when Qwen issues a 'ground' action.
-        e.g. query = "Settings app icon on home screen"
+        Prefer screenshot_url (server fetches binary) over sending base64.
         """
         log.info(f"UI targeted grounding: {query!r}")
-        return self._grounding_call(png_bytes, query=query)
+        return self._grounding_call(png_bytes, query=query, screenshot_url=screenshot_url)
 
-    def _grounding_call(self, png_bytes: bytes, query: Optional[str]) -> list[UIElement]:
+    def _grounding_call(
+        self,
+        png_bytes: bytes,
+        query: Optional[str],
+        screenshot_url: Optional[str] = None,
+    ) -> list[UIElement]:
         if not self.server_running():
             raise RuntimeError(
                 "UI server not running. Start with: python3 cli.py server start"
             )
         label = f"query={query!r}" if query else "full-screen"
-        log.info(f"UI grounding ({label}): {len(png_bytes)//1024}KB → ui_server")
-        t0 = time.time()
-        payload: dict = {"image_base64": base64.b64encode(png_bytes).decode()}
+        if screenshot_url:
+            log.info(f"UI grounding ({label}) via image_url → ui_server")
+            payload: dict = {"image_url": screenshot_url}
+        else:
+            log.info(f"UI grounding ({label}): {len(png_bytes)//1024}KB → ui_server")
+            payload = {"image_base64": base64.b64encode(png_bytes).decode()}
         if query:
             payload["query"] = query
+        t0 = time.time()
         resp = self._post("/grounding", payload)
         log.debug(f"UI grounding response ({time.time()-t0:.1f}s): {resp.get('raw','')!r:.120}")
         elements = self._parse_grounding(resp.get("raw", ""))
         log.info(f"UI grounding done: {len(elements)} elements ({time.time()-t0:.1f}s)")
         return elements
 
-    def referring(self, png_bytes: bytes, bbox: list[int]) -> str:
-        """Describe a UI region. Calls /referring on ui_server."""
+    def referring(
+        self,
+        png_bytes: bytes,
+        bbox: list[int],
+        screenshot_url: Optional[str] = None,
+    ) -> str:
+        """Describe a UI region. Prefer screenshot_url over base64."""
         if not self.server_running():
             raise RuntimeError("UI server not running. Start with: python3 cli.py server start")
-        resp = self._post("/referring", {
-            "image_base64": base64.b64encode(png_bytes).decode(),
-            "bbox": bbox,
-        })
+        if screenshot_url:
+            payload: dict = {"image_url": screenshot_url, "bbox": bbox}
+        else:
+            payload = {
+                "image_base64": base64.b64encode(png_bytes).decode(),
+                "bbox": bbox,
+            }
+        resp = self._post("/referring", payload)
         return resp.get("description", "").strip()
 
     # ── Parsing ────────────────────────────────────────────────────────────────

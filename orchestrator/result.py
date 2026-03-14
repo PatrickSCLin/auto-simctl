@@ -82,20 +82,24 @@ class StepLog:
 @dataclass
 class TaskResult:
     success: bool
+    task: str
     steps_taken: int
     conclusion: str
+    plan: Optional[str] = None
     logs: list[StepLog] = field(default_factory=list)
     blocked_reason: Optional[str] = None
     device_udid: str = ""
-    task: str = ""
 
     def to_dict(self) -> dict:
         return {
             "success": self.success,
+            "task": self.task,
+            "plan": self.plan,
             "steps_taken": self.steps_taken,
             "conclusion": self.conclusion,
             "blocked_reason": self.blocked_reason,
-            "evidence": [log.to_dict() for log in self.logs],
+            "logs": [log.to_dict() for log in self.logs],
+            "device_udid": self.device_udid,
         }
 
     def to_json(self, indent: int = 2) -> str:

@@ -10,7 +10,7 @@ ok()   { echo -e "${GREEN}[ok]${NC}  $*"; }
 info() { echo -e "${YELLOW}[..] ${NC} $*"; }
 err()  { echo -e "${RED}[err]${NC} $*"; }
 
-QWEN_MODEL_DIR="$HOME/.cache/huggingface/hub/qwen3.5-2b-mlx-4bit"
+QWEN_MODEL_DIR="$HOME/.cache/huggingface/hub/qwen3.5-9b-mlx-4bit"
 UIUG_MODEL_DIR="$HOME/.cache/huggingface/hub/ui-ug-7b-2601"
 
 echo ""
@@ -60,6 +60,7 @@ pip3 install --quiet --upgrade \
     "pure-python-adb>=0.2.2.dev0" \
     "mlx-openai-server>=1.6.0" \
     "mlx-vlm>=0.4.0" \
+    "mlx-lm>=0.30.0" \
     "openai>=1.0.0" \
     "typer>=0.9.0" \
     "rich>=13.0.0" \
@@ -67,20 +68,20 @@ pip3 install --quiet --upgrade \
     "huggingface_hub>=0.20.0"
 ok "Python dependencies installed"
 
-# ── 4. Check / download Qwen3.5-2B-4bit ──────────────────────────────────────
-info "Checking Qwen3.5-2B-4bit model..."
+# ── 4. Check / download Qwen3.5-9B-4bit ──────────────────────────────────────
+info "Checking Qwen3.5-9B-4bit model..."
 if [[ -f "$QWEN_MODEL_DIR/config.json" ]]; then
-    ok "Qwen3.5-2B-4bit found at $QWEN_MODEL_DIR"
+    ok "Qwen3.5-9B-4bit found at $QWEN_MODEL_DIR"
 else
-    info "Downloading Qwen3.5-2B-4bit (this may take a few minutes)..."
+    info "Downloading Qwen3.5-9B-4bit (this may take a few minutes)..."
     python3 - <<'PYEOF'
 from huggingface_hub import snapshot_download
 import os
-local_dir = os.path.expanduser("~/.cache/huggingface/hub/qwen3.5-2b-mlx-4bit")
-snapshot_download(repo_id="Qwen/Qwen3.5-2B-Instruct-MLX-4bit", local_dir=local_dir)
+local_dir = os.path.expanduser("~/.cache/huggingface/hub/qwen3.5-9b-mlx-4bit")
+snapshot_download(repo_id="mlx-community/Qwen3.5-9B-4bit", local_dir=local_dir)
 print("Download complete.")
 PYEOF
-    ok "Qwen3.5-2B-4bit downloaded"
+    ok "Qwen3.5-9B-4bit downloaded"
 fi
 
 # ── 5. Check / download UI-UG-7B-2601 ────────────────────────────────────────
@@ -110,7 +111,7 @@ echo "║         Setup complete!              ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 echo "  Models:"
-echo "    Qwen3.5-2B-4bit : $QWEN_MODEL_DIR"
+echo "    Qwen3.5-9B-4bit : $QWEN_MODEL_DIR"
 echo "    UI-UG-7B-2601   : $UIUG_MODEL_DIR"
 echo ""
 echo "  Usage:"

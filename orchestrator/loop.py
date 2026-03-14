@@ -19,6 +19,7 @@ Navigation stack gives Qwen full context:
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Callable, Optional
 
@@ -27,6 +28,7 @@ from agents.qwen_agent import QwenAgent
 from agents.ui_agent import UIAgent
 from mdb.bridge import DeviceBridge
 from mdb.models import Action
+from vision_screenshot_server import get_screenshot_url, set_current_screenshot
 
 from .result import NavFrame, ScrollState, StepLog, TaskResult
 
@@ -90,6 +92,140 @@ def _best_acc_match(elements: list[dict], query: str) -> Action:
     )
 
 
+# Task "打開 X app" / "open X app" → match foreground by name or bundle_id
+_OPEN_APP_NORMALIZE = {"檔案": "files", "設定": "settings", "相片": "photos", "日曆": "calendar"}
+_OPEN_APP_BUNDLE_SUBSTR = {
+    "files": ["documentsapp", "files"],
+    "settings": ["preferences", "settings"],
+    "photos": ["mobileslideshow", "photos"],
+    "calendar": ["mobilecal", "calendar"],
+}
+
+
+def _open_app_tap_if_visible(task: str, acc_elements: list) -> Optional[Action]:
+    """
+    If task is '打開 X app' and the X icon is visible as a Button in elements,
+    return a direct tap action — no Qwen needed.
+    """
+    if not acc_elements:
+        return None
+    m = re.search(r"打開\s*([^\s]+)(?:\s*app)?", task) or re.search(r"open\s+(\w+)\s+app", task, re.I)
+    if not m:
+        return None
+    x = m.group(1).strip().lower()
+    x_norm = _OPEN_APP_NORMALIZE.get(x, x)
+    if len(x_norm) < 2:
+        return None
+    keywords = [x_norm] + _OPEN_APP_BUNDLE_SUBSTR.get(x_norm, [])
+    visible_buttons = [
+        e for e in acc_elements
+        if e.get("visible", True) and e.get("type") == "Button"
+    ]
+    for el in visible_buttons:
+        label = el.get("label", "").lower()
+        if any(kw in label for kw in keywords):
+            cx, cy = el.get("cx", 0), el.get("cy", 0)
+            log.info(
+                f"App icon '{el.get('label')}' visible in elements → "
+                f"direct tap({cx},{cy}), skip Qwen"
+            )
+            return Action(
+                action_type="tap", x=cx, y=cy,
+                reasoning=f"App icon '{el.get('label')}' visible in elements, tapped directly.",
+            )
+    return None
+
+
+def _open_app_done_from_elements(task: str, acc_elements: list) -> Optional[Action]:
+    """
+    Pure-elements fast-path for "打開 X app".
+    If elements have Tab Bar + (No Recents | in-app empty state) AND an "X | Application"
+    label that matches the target app → done, no MDB needed.
+
+    Example elements when inside Files:
+      Files | Application
+      No Recents | StaticText
+      Tab Bar | Group
+    """
+    if not acc_elements:
+        return None
+    task = task.strip()
+    m = re.search(r"打開\s*([^\s]+)(?:\s*app)?", task) or re.search(r"open\s+(\w+)\s+app", task, re.I)
+    if not m:
+        return None
+    x = m.group(1).strip().lower()
+    x_norm = _OPEN_APP_NORMALIZE.get(x, x)
+    if len(x_norm) < 2:
+        return None
+
+    visible = [e for e in acc_elements if e.get("visible", True)]
+    labels_lower = " ".join(e.get("label", "") for e in visible).lower()
+
+    has_tab_bar = "tab bar" in labels_lower
+    has_in_app_state = "no recents" in labels_lower or "recently opened" in labels_lower
+    if not (has_tab_bar and has_in_app_state):
+        return None
+
+    # Look for "X | Application" where X matches the target app name
+    keywords = [x_norm] + _OPEN_APP_BUNDLE_SUBSTR.get(x_norm, [])
+    app_label = next(
+        (e.get("label", "") for e in visible
+         if "application" in e.get("type", "").lower() or
+            (e.get("label", "") and any(kw in e.get("label", "").lower() for kw in keywords))),
+        None
+    )
+    if app_label and any(kw in app_label.lower() for kw in keywords):
+        return Action(
+            action_type="done",
+            result=f"Elements confirm '{app_label}' is open (Tab Bar + No Recents detected).",
+            reasoning="Accessibility elements show in-app UI for target app; done without LLM or MDB.",
+        )
+    return None
+
+
+def _open_app_done_if_foreground(
+    task: str, foreground_app: dict, acc_elements: list
+) -> Optional[Action]:
+    """
+    Fast-path for "打開 X app": elements-first, MDB as fallback confirmation.
+    Priority: pure elements check (no stale MDB issues) → MDB + elements combined.
+    """
+    # Try pure-elements path first (doesn't depend on MDB at all)
+    action = _open_app_done_from_elements(task, acc_elements)
+    if action:
+        return action
+
+    # Fallback: MDB foreground + elements showing in-app
+    if not foreground_app:
+        return None
+    labels_lower = " ".join(
+        e.get("label", "") for e in acc_elements if e.get("visible", True)
+    ).lower()
+    has_tab_bar = "tab bar" in labels_lower
+    has_in_app = "no recents" in labels_lower or "application" in labels_lower
+    if not (has_tab_bar and has_in_app):
+        return None
+
+    task_s = task.strip()
+    m = re.search(r"打開\s*([^\s]+)(?:\s*app)?", task_s) or re.search(r"open\s+(\w+)\s+app", task_s, re.I)
+    if not m:
+        return None
+    x = m.group(1).strip().lower()
+    x_norm = _OPEN_APP_NORMALIZE.get(x, x)
+    if len(x_norm) < 2:
+        return None
+    name = (foreground_app.get("name") or "").lower()
+    bid = (foreground_app.get("bundle_id") or "").lower()
+    keywords = [x_norm] + _OPEN_APP_BUNDLE_SUBSTR.get(x_norm, [])
+    if any(kw in name or kw in bid for kw in keywords):
+        return Action(
+            action_type="done",
+            result=f"App '{foreground_app.get('name', '')}' in foreground and elements show in-app (MDB+AX).",
+            reasoning="Foreground matches task and accessibility shows in-app UI; done without LLM.",
+        )
+    return None
+
+
 def _extract_screen_label(action: Action) -> str:
     """Extract a short screen label from Qwen's reasoning or action."""
     if action.reasoning:
@@ -97,6 +233,7 @@ def _extract_screen_label(action: Action) -> str:
         first = action.reasoning.split(".")[0].strip()
         return first[:60] if first else "unknown screen"
     return f"after {action}"
+
 
 
 def _swipe_direction(action: Action) -> str:
@@ -150,9 +287,67 @@ class Orchestrator:
         self.step_delay_ms = step_delay_ms
         self.on_step = on_step
 
+    def _is_on_home_screen(self, device_udid: str) -> bool:
+        """
+        True if SpringBoard is the foreground app (home screen / app grid).
+        SpringBoard bundle ID: com.apple.springboard
+        """
+        try:
+            fg = self.mdb.get_foreground_app(device_udid)
+            if fg:
+                bid = (fg.get("bundle_id") or "").lower()
+                return "springboard" in bid
+        except Exception:
+            pass
+        return False
+
     def run(self, task: str, device_udid: str) -> TaskResult:
         logs: list[StepLog] = []
         history: list[dict] = []
+
+        log.info(f"Starting task: {task!r} on device {device_udid[:12]}...")
+        task_plan: Optional[str] = None
+
+        # ── Pre-flight: ensure we start from the MAIN home screen page ──────────
+        # Main home page: has app icon Buttons (Files, Contacts…) AND ≤ 12 elements.
+        # Today View: also has dock but has 13+ elements (widgets). Distinguish by count.
+        def _on_main_home() -> bool:
+            try:
+                els = self.mdb.list_elements(device_udid)
+                visible = [e for e in els if e.get("visible", True)]
+                labels = {e.get("label", "").lower() for e in visible}
+                # Main home: small element count + at least one app icon Button
+                has_app_icons = any(
+                    e.get("type") == "Button" and len(e.get("label", "")) > 2
+                    for e in visible
+                )
+                return has_app_icons and len(visible) <= 12
+            except Exception:
+                return False
+
+        try:
+            if not self._is_on_home_screen(device_udid):
+                log.info("Not on home screen — pressing HOME to exit foreground app.")
+                self.mdb.press_key(device_udid, "HOME")
+                time.sleep(0.9)
+
+            if not _on_main_home():
+                # Today View is to the LEFT of page 0; swipe LEFT (350→50) to go to page 0.
+                log.info("On a side page (Today View?) — swiping left to main home page.")
+                self.mdb.swipe(device_udid, 350, 437, 50, 437, 300)
+                time.sleep(0.6)
+
+            if not _on_main_home():
+                log.info("Still not on main home — pressing HOME once more.")
+                self.mdb.press_key(device_udid, "HOME")
+                time.sleep(0.6)
+
+            if not _on_main_home():
+                log.info("Trying swipe left once more to reach page 0.")
+                self.mdb.swipe(device_udid, 350, 437, 50, 437, 300)
+                time.sleep(0.5)
+        except Exception as e:
+            log.warning(f"Pre-flight HOME/swipe failed (non-fatal): {e}")
 
         # Navigation stack: always starts with root frame
         nav_stack: list[NavFrame] = [
@@ -160,8 +355,6 @@ class Orchestrator:
         ]
         last_action_str: Optional[str] = None
         same_action_count = 0
-
-        log.info(f"Starting task: {task!r} on device {device_udid[:12]}...")
 
         for step in range(1, self.max_steps + 1):
             step_log = StepLog(step=step, action=Action(action_type="error"))
@@ -179,10 +372,10 @@ class Orchestrator:
                 step_log.error = f"Screenshot failed: {e}"
                 logs.append(step_log)
                 return TaskResult(
-                    success=False, steps_taken=step,
+                    success=False, task=task, steps_taken=step,
                     conclusion=f"Screenshot failed: {e}",
-                    logs=logs, blocked_reason=str(e),
-                    device_udid=device_udid, task=task,
+                    plan=task_plan, logs=logs, blocked_reason=str(e),
+                    device_udid=device_udid,
                 )
 
             # ── 1b. Dialog detection + auto-dismiss ───────────────────────────
@@ -272,9 +465,9 @@ class Orchestrator:
                     # HOME for go-home task = done
                     log.info("HOME pressed — task complete.")
                     return TaskResult(
-                        success=True, steps_taken=step,
+                        success=True, task=task, steps_taken=step,
                         conclusion="Returned to home screen successfully.",
-                        logs=logs, device_udid=device_udid, task=task,
+                        plan=task_plan, logs=logs, device_udid=device_udid,
                     )
 
             # ── 1d. Accessibility elements + scroll info snapshot ─────────────
@@ -307,32 +500,73 @@ class Orchestrator:
             except Exception as e:
                 log.debug(f"list_elements error (non-fatal): {e}")
 
-            # ── 2. Qwen phase-1 ───────────────────────────────────────────────
-            log.info("Qwen analyzing screen...")
-            t_qwen = time.time()
-            try:
-                action = self.qwen.decide(
-                    task=task,
-                    screenshot_data_url=shot.data_url,
-                    ui_elements=acc_elements,
-                    history=history,
-                    step=step,
-                    max_steps=self.max_steps,
-                    nav_stack=nav_stack,
-                    dialog_info=dialog_info,
-                    scroll_info=scroll_info,
-                    keyboard_open=keyboard_open,
-                )
-                log.info(f"Qwen phase-1 ({time.time()-t_qwen:.1f}s): {action}")
-            except Exception as e:
-                logs.append(step_log)
-                log.error(f"Qwen phase-1 failed: {e}")
-                return TaskResult(
-                    success=False, steps_taken=step,
-                    conclusion=f"Qwen reasoning failed: {e}",
-                    logs=logs, blocked_reason=str(e),
-                    device_udid=device_udid, task=task,
-                )
+            # ── 2. Qwen phase-1 (or MDB fast-path for "打開 X app") ─────────────
+            set_current_screenshot(shot.png_bytes)
+            foreground_app = self.mdb.get_foreground_app(device_udid)
+            if foreground_app:
+                log.debug(f"Foreground app: {foreground_app.get('bundle_id')} ({foreground_app.get('name')})")
+            action = _open_app_done_if_foreground(task, foreground_app or {}, acc_elements)
+            if action is not None:
+                log.info(f"MDB foreground matches task → done (skip Qwen): {action.result}")
+            elif (tap_action := _open_app_tap_if_visible(task, acc_elements)) is not None:
+                action = tap_action
+            else:
+                log.info("Qwen analyzing screen...")
+                t_qwen = time.time()
+                try:
+                    action = self.qwen.decide(
+                        task=task,
+                        screenshot_data_url=shot.data_url,
+                        screenshot_url=get_screenshot_url(),
+                        ui_elements=acc_elements,
+                        history=history,
+                        step=step,
+                        max_steps=self.max_steps,
+                        nav_stack=nav_stack,
+                        dialog_info=dialog_info,
+                        scroll_info=scroll_info,
+                        keyboard_open=keyboard_open,
+                        foreground_app=foreground_app,
+                    )
+                    log.info(f"Qwen phase-1 ({time.time()-t_qwen:.1f}s): {action}")
+                except Exception as e:
+                    logs.append(step_log)
+                    log.error(f"Qwen phase-1 failed: {e}")
+                    return TaskResult(
+                        success=False, steps_taken=step,
+                        conclusion=f"Qwen reasoning failed: {e}",
+                        plan=task_plan, logs=logs, blocked_reason=str(e),
+                        device_udid=device_udid, task=task,
+                    )
+
+            # ── 2b. Snap tap to nearest accessible element ────────────────────
+            # Qwen sometimes hallucinates coordinates from the screenshot.
+            # When we have accessibility elements (which already carry correct
+            # cx/cy from the system), snap any tap that is out-of-bounds or
+            # suspiciously far from every element to the closest match by label.
+            if (action.action_type == "tap" and acc_elements and
+                    (action.x is None or action.y is None or
+                     action.x > 402 or action.y > 874)):
+                visible_els = [e for e in acc_elements if e.get("visible", True)]
+                if visible_els:
+                    best = min(
+                        visible_els,
+                        key=lambda e: (
+                            (e.get("cx", 201) - (action.x or 201)) ** 2 +
+                            (e.get("cy", 437) - (action.y or 437)) ** 2
+                        ),
+                    )
+                    old_coords = (action.x, action.y)
+                    action = Action(
+                        action_type="tap",
+                        x=best["cx"], y=best["cy"],
+                        reasoning=action.reasoning,
+                    )
+                    log.warning(
+                        f"Tap coords {old_coords} out of bounds — "
+                        f"snapped to nearest element '{best.get('label')}' "
+                        f"at ({best['cx']},{best['cy']})"
+                    )
 
             # ── 3. Ground loop ────────────────────────────────────────────────
             # Qwen emits ground(query) when it cannot determine exact coordinates.
@@ -355,11 +589,13 @@ class Orchestrator:
                     # We have the full list — let Qwen do semantic matching.
                     log.info(f"Accessibility has {len(acc_elements)} elements — "
                              "asking Qwen to select the best match")
+                    set_current_screenshot(shot.png_bytes)
                     t2 = time.time()
                     try:
                         action = self.qwen.decide(
                             task=task,
                             screenshot_data_url=shot.data_url,
+                            screenshot_url=get_screenshot_url(),
                             ui_elements=acc_elements,
                             history=history,
                             step=step,
@@ -367,22 +603,25 @@ class Orchestrator:
                             grounding_result=acc_elements,
                             nav_stack=nav_stack,
                             ground_query=query,
+                            foreground_app=foreground_app,
                         )
                         log.info(f"Qwen phase-2/acc ({time.time()-t2:.1f}s): {action}")
                     except Exception as e:
                         log.warning(f"Qwen phase-2 exception: {e}")
                         action = Action(action_type="error", result=str(e))
 
-                    # Fallback: if Qwen still can't decide, auto-pick best label match
                     if action.action_type in ("ground", "error"):
-                        action = _best_acc_match(acc_elements, query)
+                        action = _best_tap_from_elements(acc_elements, query)
                         log.warning(f"Phase-2 acc fallback — auto-picked: {action}")
 
                 else:
                     # ── Strategy B: UI-UG visual grounding (no accessibility) ──
                     log.info(f"No accessibility elements — using UI-UG for {query!r}")
+                    set_current_screenshot(shot.png_bytes)
                     try:
-                        elements = self.ui_agent.grounding_targeted(shot.png_bytes, query)
+                        elements = self.ui_agent.grounding_targeted(
+                            shot.png_bytes, query, screenshot_url=get_screenshot_url()
+                        )
                         step_log.ui_elements = elements
                         log.info(f"UI-UG: {len(elements)} element(s) for {query!r}")
                     except Exception as e:
@@ -392,11 +631,13 @@ class Orchestrator:
 
                     # Qwen phase-2 picks from UI-UG results
                     log.info("Qwen phase-2/visual: deciding from UI-UG grounding...")
+                    set_current_screenshot(shot.png_bytes)
                     t2 = time.time()
                     try:
                         action = self.qwen.decide(
                             task=task,
                             screenshot_data_url=shot.data_url,
+                            screenshot_url=get_screenshot_url(),
                             ui_elements=element_dicts,
                             history=history,
                             step=step,
@@ -404,6 +645,7 @@ class Orchestrator:
                             grounding_result=element_dicts,
                             nav_stack=nav_stack,
                             ground_query=query,
+                            foreground_app=foreground_app,
                         )
                         log.info(f"Qwen phase-2/visual ({time.time()-t2:.1f}s): {action}")
                     except Exception as e:
@@ -457,17 +699,21 @@ class Orchestrator:
             if action.action_type == "done":
                 log.info(f"Task done: {action.result}")
                 return TaskResult(
-                    success=True, steps_taken=step,
+                    success=True,
+                    task=task,
+                    plan=task_plan,
+                    steps_taken=step,
                     conclusion=action.result or "Task completed.",
-                    logs=logs, device_udid=device_udid, task=task,
+                    logs=logs,
+                    device_udid=device_udid,
                 )
             if action.action_type == "error":
                 log.warning(f"Task error: {action.result}")
                 return TaskResult(
-                    success=False, steps_taken=step,
+                    success=False, task=task, steps_taken=step,
                     conclusion=action.result or "Task failed.",
-                    logs=logs, blocked_reason=action.result,
-                    device_udid=device_udid, task=task,
+                    plan=task_plan, logs=logs, blocked_reason=action.result,
+                    device_udid=device_udid,
                 )
 
             # ── 7. Execute ────────────────────────────────────────────────────
@@ -477,12 +723,11 @@ class Orchestrator:
                 log.info("Action executed OK")
             except Exception as e:
                 log.error(f"Execute failed: {e}")
-                return TaskResult(
-                    success=False, steps_taken=step,
-                    conclusion=f"Action execution failed: {e}",
-                    logs=logs, blocked_reason=str(e),
-                    device_udid=device_udid, task=task,
-                )
+                step_log.error = str(e)
+                # Don't terminate — let Qwen see the failure and recover
+                history[-1]["error"] = str(e)
+                time.sleep(0.3)
+                continue
 
             # ── 8. Update navigation stack ────────────────────────────────────
             if _is_navigation_action(action):
@@ -538,18 +783,35 @@ class Orchestrator:
                     if any(kw in task.lower() for kw in _GOTO_HOME_KEYWORDS):
                         log.info("HOME key confirms task completion for 'go home' task.")
                         return TaskResult(
-                            success=True, steps_taken=step,
+                            success=True, task=task, steps_taken=step,
                             conclusion="Returned to home screen successfully.",
-                            logs=logs, device_udid=device_udid, task=task,
+                            plan=task_plan, logs=logs, device_udid=device_udid,
                         )
 
-            # ── 9. Wait before next step ──────────────────────────────────────
+            # ── 9. Post-action screen context injection ────────────────────
+            # After tap/launch, quickly read the new screen's key elements
+            # and inject into history so AI can detect "done" on next step.
+            if action.action_type in ("tap", "launch_app"):
+                try:
+                    time.sleep(0.3)
+                    post_elements = self.mdb.list_elements(device_udid)
+                    # Extract headings/nav bar labels as a screen summary
+                    screen_hints = []
+                    for el in post_elements:
+                        if el.get("type") in ("Heading", "NavigationBar") and el.get("label"):
+                            screen_hints.append(f"{el['type']}: {el['label']}")
+                    if screen_hints:
+                        history[-1]["screen_after"] = ", ".join(screen_hints[:3])
+                except Exception:
+                    pass
+
+            # ── 10. Wait before next step ──────────────────────────────────────
             if self.step_delay_ms > 0:
                 time.sleep(self.step_delay_ms / 1000.0)
 
         return TaskResult(
-            success=False, steps_taken=self.max_steps,
+            success=False, task=task, steps_taken=self.max_steps,
             conclusion=f"Reached max steps ({self.max_steps}) without completing the task.",
-            logs=logs, blocked_reason="max_steps_reached",
-            device_udid=device_udid, task=task,
+            plan=task_plan, logs=logs, blocked_reason="max_steps_reached",
+            device_udid=device_udid,
         )

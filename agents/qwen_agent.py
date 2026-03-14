@@ -1,12 +1,15 @@
 """
-QwenAgent — reasoning engine using Qwen3.5-2B-4bit via mlx-openai-server.
+QwenAgent — reasoning engine using Qwen3.5-9B-4bit via mlx-openai-server.
 
 Calls the local OpenAI-compatible server started by mlx-openai-server.
 Server must be running at http://localhost:8080/v1 (see server_manager.py).
+
+4bit quant uses less memory than 6bit; good for latency and Macs with limited RAM.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -19,11 +22,61 @@ from agents.prompts import SYSTEM_PROMPT, build_user_message
 
 log = get_logger("qwen_agent")
 
-DEFAULT_MODEL_PATH = str(
-    Path.home() / ".cache" / "huggingface" / "hub" / "qwen3.5-2b-mlx-4bit"
-)
+
+def _redact_image_from_content(messages: list[dict]) -> list[dict]:
+    """Return a copy of messages with image_url content redacted (for logging only)."""
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            redacted = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    redacted.append({"type": "image_url", "image_url": {"url": "[image redacted]"}})
+                else:
+                    redacted.append(part)
+            out.append({**m, "content": redacted})
+        else:
+            out.append(dict(m))
+    return out
+
+DEFAULT_MODEL_PATH = os.path.expanduser("~/.cache/huggingface/hub/qwen3.5-9b-mlx-4bit")
+DEFAULT_PORT = 8000
 DEFAULT_SERVER_URL = "http://localhost:8080/v1"
-DEFAULT_MODEL_NAME = "qwen3.5-2b"   # model name sent to the API (any string works)
+DEFAULT_MODEL_NAME = "qwen3.5-9b"   # model name sent to the API (any string works)
+
+# Keywords that signal a complex task requiring chain-of-thought reasoning
+_THINKING_KEYWORDS = {
+    # Programming / debugging
+    "程式", "code", "debug", "bug", "error", "fix", "寫", "寫程式", "implement",
+    "function", "class", "script", "python", "swift", "javascript", "compile",
+    # Multi-step reasoning
+    "分析", "compare", "差異", "analyze", "why", "explain", "怎麼", "如何",
+    "設定", "settings",  # Settings navigation is deeper and more branchy
+    # Ambiguous / complex navigation
+    "搜尋", "search for", "find the", "navigate to", "go to",
+}
+
+# Simple one-shot tasks that don't benefit from long reasoning
+_NO_THINKING_PATTERNS = [
+    r"打開\s*\S+\s*app",          # 打開 X app
+    r"open\s+\w+\s+app",          # open X app
+    r"back|返回|回上一頁",
+    r"press home|按 home",
+    r"scroll (up|down|left|right)",
+    r"tap\s+\w+",
+]
+
+
+def _needs_thinking(task: str) -> bool:
+    """
+    Heuristic: True = use chain-of-thought (slower but accurate).
+    Thinking is OFF only for tasks where Qwen has a MDB/elements fast-path
+    and won't need to estimate coordinates itself. For everything else, use thinking.
+    """
+    # Always think — the no-thinking model produces invalid coordinates too often.
+    # TODO: revisit when we have a lighter model or better coordinate grounding.
+    return True
 
 
 class QwenAgent:
@@ -37,14 +90,16 @@ class QwenAgent:
         server_url: str = DEFAULT_SERVER_URL,
         model_name: str = DEFAULT_MODEL_NAME,
         model_path: str = DEFAULT_MODEL_PATH,
-        max_tokens: int = 512,
+        max_tokens: int = 4096,
         temperature: float = 0.0,
+        repetition_penalty: float = 1.12,
     ) -> None:
         self.server_url = server_url
         self.model_name = model_name
         self.model_path = model_path
-        self.max_tokens = max_tokens
-        self.temperature = temperature
+        self.max_tokens = max_tokens       # 4096: room for long <think> + JSON; avoids truncation
+        self.temperature = temperature     # 0.0: deterministic actions
+        self.repetition_penalty = repetition_penalty  # 1.12: mild penalty to reduce repetition
         self._client = None
 
     def _get_client(self):
@@ -84,12 +139,12 @@ class QwenAgent:
         cmd = [
             str(server_bin), "launch",
             "--model-path", self.model_path,
-            "--model-type", "multimodal",
+            "--model-type", "multimodal",  # VLM: Qwen sees screenshot (vision)
             "--port", str(port),
             "--host", "127.0.0.1",
             "--max-tokens", "4096",
         ]
-        log.info(f"Starting mlx-openai-server on port {port} with model {self.model_path}")
+        log.info(f"Starting mlx-openai-server (multimodal) on port {port} with model {self.model_path}")
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         deadline = time.time() + wait_secs
@@ -117,6 +172,8 @@ class QwenAgent:
         ground_query: Optional[str] = None,
         scroll_info: Optional[dict] = None,
         keyboard_open: bool = False,
+        screenshot_url: Optional[str] = None,
+        foreground_app: Optional[dict] = None,
     ) -> Action:
         """
         Phase 1 (grounding_result=None):
@@ -127,7 +184,8 @@ class QwenAgent:
           Qwen receives UI-UG's precise element locations → must return
           a direct action (tap/swipe/etc.)
 
-        Returns an Action. May return action_type='ground' in phase 1.
+        Prefer screenshot_url over screenshot_data_url so the server fetches binary
+        (avoids base64 in request body). We never log image data; server logs are out of our control.
         """
         if not self.server_running():
             raise RuntimeError(
@@ -140,7 +198,7 @@ class QwenAgent:
         client = self._get_client()
         user_content = build_user_message(
             task=task,
-            screenshot_data_url=screenshot_data_url,
+            screenshot_data_url=screenshot_data_url or "",
             ui_elements=ui_elements,
             history=history,
             step=step,
@@ -151,6 +209,8 @@ class QwenAgent:
             ground_query=ground_query,
             scroll_info=scroll_info,
             keyboard_open=keyboard_open,
+            screenshot_url=screenshot_url,
+            foreground_app=foreground_app,
         )
 
         messages = [
@@ -158,26 +218,35 @@ class QwenAgent:
             {"role": "user", "content": user_content},
         ]
 
+        # Debug log never includes image data (avoid base64 dump in verbose)
+        if log.isEnabledFor(10):  # DEBUG
+            log.debug("request messages (image redacted): %s", _redact_image_from_content(messages))
+
+        thinking = _needs_thinking(task)
+        log.info(f"Qwen thinking={'on' if thinking else 'off'} for task: {task!r:.60}")
+
         t0 = time.time()
         response = client.chat.completions.create(
             model=self.model_name,
             messages=messages,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
-            # Disable Qwen3 thinking mode so it outputs JSON directly
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={
+                "chat_template_kwargs": {"enable_thinking": thinking},
+                "repetition_penalty": self.repetition_penalty,
+            },
         )
         elapsed = time.time() - t0
-
         raw = response.choices[0].message.content.strip()
         log.debug(f"Qwen raw ({elapsed:.1f}s): {raw!r:.400}")
-
-        # Strip <think>...</think> blocks emitted by Qwen3 thinking mode
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        if "</think>" in raw:
+            raw = raw.split("</think>", 1)[-1].strip()
 
         action = self._parse_action(raw)
 
         # If still prose after stripping: try prose → action extraction
+        raw = action.result or ""  # action.result holds original text on parse error
         if action.action_type == "error" and raw and not raw.strip().startswith("{"):
             log.warning("Qwen output was prose — attempting prose extraction")
             action_from_prose = self._extract_from_prose(raw)
@@ -191,14 +260,11 @@ class QwenAgent:
                     {"role": "system", "content": "Output ONLY a JSON object. No text."},
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": screenshot_data_url, "detail": "low"}},
-                            {"type": "text", "text": (
-                                f"Task: {task}\n"
-                                + (f"UI elements: {json.dumps(ui_elements[:5])}\n" if ui_elements else "")
-                                + "Output ONE JSON action: tap/swipe/input_text/press_key/launch_app/ground/done/error."
-                            )},
-                        ],
+                        "content": (
+                            f"Task: {task}\n"
+                            + (f"UI elements: {json.dumps(ui_elements[:5])}\n" if ui_elements else "")
+                            + "Output ONE JSON action: tap/swipe/input_text/press_key/launch_app/ground/done/error."
+                        ),
                     },
                 ]
                 t1 = time.time()
@@ -206,9 +272,12 @@ class QwenAgent:
                     retry_resp = client.chat.completions.create(
                         model=self.model_name,
                         messages=retry_messages,
-                        max_tokens=256,
-                        temperature=0.0,
-                        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                        max_tokens=self.max_tokens,
+                        temperature=self.temperature,
+                        extra_body={
+                            "chat_template_kwargs": {"enable_thinking": True},
+                            "repetition_penalty": self.repetition_penalty,
+                        },
                     )
                     raw2 = re.sub(
                         r"<think>.*?</think>", "",
