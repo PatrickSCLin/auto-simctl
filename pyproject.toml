@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-simctl"
-version = "0.1.0"
+version = "0.1.1"
 description = "Intelligent mobile simulator control — AI-driven device testing for vibe coding"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,7 +27,14 @@ dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [project.scripts]
 auto-simctl = "cli:app"
+auto-simctl-mcp = "mcp_server.server:main"
+
+[tool.setuptools]
+py-modules = ["cli", "logger"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mdb*", "agents*", "orchestrator*", "mcp_server*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]

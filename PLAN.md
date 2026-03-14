@@ -1,6 +1,6 @@
 # auto-simctl: Intelligent Mobile Simulator Control
 
-> **Vibe Coding 的最後一塊拼圖** — AI 自動測試手機 app，截圖 → 無障礙樹理解 → Qwen 推理 → 執行 → 回報結果，讓 vibe coding 工具真正能驗收 mobile 開發成果。
+> **The missing feedback loop for vibe coding on mobile** — AI agent takes screenshots, understands the UI via the accessibility tree, reasons with Qwen, executes actions, and reports results, enabling autonomous mobile QA directly in the coding loop.
 
 ## Goal
 
@@ -232,7 +232,7 @@ def _needs_thinking(task: str) -> bool:
 | 3    | Image second            | Screenshot confirms, elements table is authoritative for coordinates             |
 | 4    | Done (generic)          | Screen/elements clearly show task result → done                                  |
 | 5    | Tap coords              | ALWAYS use (cx,cy) from elements table; NEVER estimate from screenshot           |
-| 6    | Language bridge         | 設定→Settings, 檔案→Files, 相片→Photos                                            |
+| 6    | Language bridge         | Qwen semantically maps any language task to English UI labels (e.g. Settings, Files, Photos) |
 | 7    | Keyboard               | Keyboard open → `input_text()`, never tap letter keys                           |
 | 8    | Scroll + page swipe     | Vertical: `swipe(201,700,201,200)` = down. Horizontal: `swipe(350,437,50,437)` = swipe left (next page) |
 | 9    | Dialogs                 | Handle system dialogs first                                                       |
@@ -314,9 +314,9 @@ return TaskResult(success, steps, logs)
 
 | Fast-path | Trigger | Action |
 |-----------|---------|--------|
-| `_open_app_done_from_elements` | task = "打開 X app" + elements have Tab Bar + No Recents + X label | → `done` |
+| `_open_app_done_from_elements` | task = "open X app" + elements have Tab Bar + No Recents + X label | → `done` |
 | `_open_app_done_if_foreground` | MDB foreground = X + elements show in-app (Tab Bar + No Recents) | → `done` |
-| `_open_app_tap_if_visible` | task = "打開 X app" + X Button visible in elements | → `tap(cx, cy)`, skip Qwen |
+| `_open_app_tap_if_visible` | task = "open X app" + X Button visible in elements | → `tap(cx, cy)`, skip Qwen |
 
 The foreground-only check is intentionally rejected — `idb list-apps` process state can be stale (app was last open but SpringBoard is current). Elements are the ground truth.
 
@@ -378,15 +378,15 @@ Exposes four MCP tools via FastMCP 3.x:
 |------|-------------|
 | `list_devices()` | JSON array of all booted simulators + connected devices |
 | `get_screen_state(device_udid, include_screenshot)` | Current screen: JSON summary (foreground app, visible elements, scroll state) + screenshot image |
-| `act(task, device_udid)` | ONE atomic action from current state — no HOME reset. Handles gesture fast-paths (往右滑, scroll down, back…) without Qwen |
+| `act(task, device_udid)` | ONE atomic action from current state — no HOME reset. Handles gesture fast-paths (swipe right, scroll down, back…) without Qwen |
 | `run_task(task, device_udid, max_steps)` | Full autonomous multi-step AI task with HOME pre-flight reset |
 
 **Vibe coding loop:**
 ```
 get_screen_state() → see current screen
-act("點 Watch app") → tap Watch
+act("tap Watch app") → tap Watch
 get_screen_state() → confirm Watch opened
-act("往下滑") → scroll down
+act("scroll down") → scroll down
 ...
 run_task("Open Settings → enable Dark Mode") → autonomous multi-step
 ```

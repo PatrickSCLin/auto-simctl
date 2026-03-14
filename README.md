@@ -7,12 +7,12 @@
 - **Unified device bridge (MDB)**: One API over `adb` (Android) and `idb` (iOS Simulator). All coordinates clamped to screen bounds before execution.
 - **Accessibility-first UI understanding**: `idb ui describe-all` provides precise logical-point `(cx, cy)` for every element. Qwen picks *which* element; the element table supplies *where*.
 - **Qwen-as-director**: Qwen3.5-9B reasons from the accessibility tree + screenshot, decides actions, and bridges language semantics (e.g. Chinese task → English UI labels) without hardcoded translation tables.
-- **Fast-paths (no LLM)**: The orchestrator short-circuits Qwen for deterministic cases — gesture keywords (往右滑, 返回, …), open-keyboard `input_text`, app-icon visible, foreground matches target app.
+- **Fast-paths (no LLM)**: The orchestrator short-circuits Qwen for deterministic cases — gesture keywords ("swipe right", "back", …), open-keyboard `input_text`, app-icon visible, foreground matches target app.
 - **`act` — stateful one-shot mode**: Does NOT reset to HOME. Executes exactly one atomic action and returns. tap / swipe / scroll / pan are always considered done after one execution. Designed for the MCP vibe-coding loop.
 - **`run` — full autonomous mode**: Pre-flight HOME reset, then multi-step ReAct loop until the goal is complete or max steps reached.
 - **`screen` — instant screen snapshot**: Returns foreground app, visible elements with tap coordinates, scroll state, and keyboard state. With `-s` saves a screenshot.
 - **Keyboard-open fast-path**: When `act("input_text X")` is called and the keyboard is already visible, the text is typed immediately — no Qwen call needed.
-- **Compound input**: `act("輸入https://… on address textfield")` taps the field, waits for the keyboard, then types — all in one call.
+- **Compound input**: `act("type https://… on address textfield")` taps the field, waits for the keyboard, then types — all in one call.
 - **Pre-flight home reset** (`run` only): Before each task, presses HOME then corrects Today View / side launcher pages by swiping left to page 0.
 - **UI-UG fallback**: UI-UG-7B-2601 via a background HTTP server handles custom-drawn views where accessibility labels are unavailable (games, canvas, WebView).
 - **ReAct loop with navigation stack**: Screenshot → acc elements → fast-paths → Qwen → action → execute → update nav stack → repeat until done or max steps.
@@ -31,16 +31,16 @@ python3 cli.py server start
 
 # ── Full autonomous task (HOME reset, multi-step) ─────────────────────────────
 python3 cli.py run "Open Settings"
-python3 cli.py run "找看看有沒有資料夾" --verbose
+python3 cli.py run "find any folders" --verbose
 
 # ── One-shot act (no HOME reset, continues from current screen) ───────────────
-python3 cli.py act "往右滑"                                # gesture fast-path
-python3 cli.py act "點 Watch app"                          # tap
-python3 cli.py act "tap address bar"                       # tap a field (keyboard opens)
-python3 cli.py act "input_text https://google.com"         # type (keyboard must be open)
-python3 cli.py act "press enter"                           # submit — input_text does NOT auto-press Enter
-python3 cli.py act "輸入https://google.com on address bar" # tap + type in one call (still needs press enter after)
-python3 cli.py act "返回"                                   # back
+python3 cli.py act "swipe right"                                # gesture fast-path
+python3 cli.py act "tap Watch app"                              # tap
+python3 cli.py act "tap address bar"                            # tap a field (keyboard opens)
+python3 cli.py act "input_text https://google.com"              # type (keyboard must be open)
+python3 cli.py act "press enter"                                # submit — input_text does NOT auto-press Enter
+python3 cli.py act "type https://google.com on address bar"     # tap + type in one call (still needs press enter after)
+python3 cli.py act "back"                                       # back
 
 # ── Screen snapshot (for the vibe-coding brain) ───────────────────────────────
 python3 cli.py screen                  # rich text summary of current screen
@@ -80,9 +80,9 @@ For each step (max 20):
   4. Get scroll boundary info (content above/below/left/right)
   5. Detect & auto-dismiss system dialogs
   6. Fast-paths (no Qwen):
-     a. Keyboard open + input task (input_text / 輸入 / type)
+     a. Keyboard open + input task (input_text / type)
         → input_text(X) directly, skip Qwen
-     b. Gesture keyword (往右滑, 往左滑, 返回, swipe right, back, …)
+     b. Gesture keyword (swipe right, swipe left, back, scroll up, scroll down, …)
         → deterministic swipe/press, skip Qwen  [act only: also skips step loop]
      c. Elements show Tab Bar + No Recents + app label → done
      d. MDB foreground = target app + elements show in-app → done
@@ -103,7 +103,7 @@ For each step (max 20):
 - Accessibility elements carry `(cx, cy)` in logical points — Qwen decides *which* element, the element table provides *where*. Qwen never needs to estimate coordinates from the screenshot for standard iOS apps.
 - `act` is strictly one-shot: tap / swipe / scroll / pan complete after one execution. No post-action verification — the MCP caller observes via `get_screen_state`.
 - Keyboard detection drives the `input_text` fast-path: if a keyboard is visible when `input_text X` is issued, the text is typed immediately without any Qwen call.
-- `input_text` does **not** press Enter/Return automatically. If the action requires submission (URL navigation, search, form submit), follow up with a separate `act("press enter")` / `act("按 enter")`.
+- `input_text` does **not** press Enter/Return automatically. If the action requires submission (URL navigation, search, form submit), follow up with a separate `act("press enter")`.
 
 ## Project layout
 

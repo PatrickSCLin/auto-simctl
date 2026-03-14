@@ -7,15 +7,15 @@ Exposes the orchestrator as MCP tools so any MCP-compatible vibe coding tool
 Vibe coding loop
 ----------------
 1. get_screen_state()                       ← see what's on screen right now
-2. act("點 Watch app")                      ← tap something (one-shot, no HOME reset)
+2. act("tap Watch app")                     ← tap something (one-shot, no HOME reset)
 3. get_screen_state()                       ← observe the result
-4. act("往下滑") / act("返回")               ← gesture (no Qwen needed)
+4. act("scroll down") / act("back")         ← gesture (no Qwen needed)
 5. act("tap address bar")                   ← tap a text field  → keyboard opens
 6. act("input_text https://example.com")    ← keyboard open → types directly
                                               (Enter is NOT pressed automatically)
 7. act("press enter")                       ← submit / navigate (if needed)
 8. get_screen_state()                       ← confirm
-8. run_task("…complex multi-step goal…")    ← hand off to full AI agent
+9. run_task("…complex multi-step goal…")    ← hand off to full AI agent
 
 One-shot action rules (act)
 ----------------------------
@@ -23,8 +23,8 @@ One-shot action rules (act)
 - input_text X                → if keyboard is already open: types X directly (no Qwen)
                                  if keyboard is NOT open: Qwen taps the right field first,
                                  then types X in the same call
-- 輸入 X on <field>           → compound: tap field + type X (one act call)
-- gesture keywords (往右滑, back, 返回, …) → fast-path, Qwen not needed at all
+- type X on <field>           → compound: tap field + type X (one act call)
+- gesture keywords (swipe right, scroll down, back, …) → fast-path, Qwen not needed at all
 
 Tools
 -----
@@ -58,8 +58,12 @@ import sys
 import time
 from typing import Any
 
-# Make the project root importable regardless of working directory.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Make the project root importable when running directly (python mcp_server/server.py)
+# or via the auto-simctl-mcp entry point.  When installed as a package the path
+# insert is a no-op because the packages are already on sys.path.
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 try:
     from fastmcp import FastMCP
@@ -331,17 +335,16 @@ def act(
     there is no post-action verification loop.  The caller decides what to do
     next by calling get_screen_state() again.
 
-    Supported commands (natural language, Chinese or English):
+    Supported commands (natural language):
 
     Gestures (fast-path, Qwen not needed):
-      往右滑 / 往左滑 / 往上滑 / 往下滑
-      swipe right / left / up / down
+      swipe right / swipe left / swipe up / swipe down
       scroll up / scroll down
-      返回 / back / go back
+      back / go back
 
     Tap:
-      點 <name> / tap <name> / 點擊 <name>
-      e.g. "點 Watch app", "tap Settings", "點擊確認"
+      tap <name>
+      e.g. "tap Watch app", "tap Settings", "tap OK"
 
     Text input (two-step pattern):
       Step 1 — open the keyboard:
@@ -349,19 +352,19 @@ def act(
       Step 2 — type (fast-path when keyboard is open):
         act("input_text https://…")    → detects open keyboard, types directly
       Step 3 — submit (if needed):
-        act("press enter") / act("按 enter") / act("按下 go")
+        act("press enter") / act("press go")
           → input_text does NOT press Enter/Return automatically;
             if the action requires submission (URL navigation, search, form
             submit), you must issue a separate act() to press the key.
 
     Text input (compound, one call):
-      act("輸入https://… on address textfield")
+      act("type https://… on address textfield")
         → taps the field, waits for keyboard, types — all in one act() call
         → does NOT press Enter; follow up with act("press enter") if needed
 
     Args:
-        task:        What to do — e.g. "往下滑", "點 Watch app",
-                     "input_text hello world", "輸入https://google.com on address"
+        task:        What to do — e.g. "scroll down", "tap Watch app",
+                     "input_text hello world", "type https://google.com on address bar"
         device_udid: Device UDID or "auto" (default) for the first booted device.
 
     Returns:
@@ -467,5 +470,11 @@ def run_task(
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+
+def main() -> None:
+    """Entry point for the ``auto-simctl-mcp`` console script."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
