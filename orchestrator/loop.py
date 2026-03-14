@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import time
+from urllib.parse import urlparse
 from typing import Callable, Optional
 
 from logger import get_logger
@@ -37,6 +38,127 @@ log = get_logger("orchestrator")
 MAX_GROUND_PER_STEP = 2
 MAX_SAME_ACTION_REPEAT = 3
 
+# ── Gesture fast-path ─────────────────────────────────────────────────────────
+# Maps simple atomic gesture keywords → (action_type, *args).
+# Conventions (iPhone 16 Pro, 402×874 logical points):
+#
+#   "往右滑" = show content to the RIGHT  → finger moves LEFT  → swipe(350,437,50,437)
+#   "往左滑" = show content to the LEFT   → finger moves RIGHT → swipe(50,437,350,437)
+#   "往上滑" = show content BELOW         → finger moves UP    → swipe(201,700,201,200)
+#   "往下滑" = show content ABOVE         → finger moves DOWN  → swipe(201,200,201,700)
+#
+# This is the standard "direction = where content goes" convention used in
+# Chinese mobile UI, not the raw gesture-direction convention.
+
+_GESTURE_MAP: dict[str, tuple] = {
+    # ── Horizontal ────────────────────────────────────────────────────────────
+    # "往右滑" / "swipe right" = next page / show right-side content
+    "往右滑":      ("swipe", 350, 437, 50,  437, 300),
+    "右滑":        ("swipe", 350, 437, 50,  437, 300),
+    "向右滑":      ("swipe", 350, 437, 50,  437, 300),
+    "swipe right": ("swipe", 350, 437, 50,  437, 300),
+    "scroll right":("swipe", 350, 437, 50,  437, 300),
+    # "往左滑" / "swipe left" = prev page / show left-side content
+    "往左滑":      ("swipe", 50,  437, 350, 437, 300),
+    "左滑":        ("swipe", 50,  437, 350, 437, 300),
+    "向左滑":      ("swipe", 50,  437, 350, 437, 300),
+    "swipe left":  ("swipe", 50,  437, 350, 437, 300),
+    "scroll left": ("swipe", 50,  437, 350, 437, 300),
+    # ── Vertical ──────────────────────────────────────────────────────────────
+    # "往上滑" / "scroll down" = reveal content below (finger goes up)
+    "往上滑":      ("swipe", 201, 700, 201, 200, 400),
+    "上滑":        ("swipe", 201, 700, 201, 200, 400),
+    "向上滑":      ("swipe", 201, 700, 201, 200, 400),
+    "swipe up":    ("swipe", 201, 700, 201, 200, 400),
+    "scroll down": ("swipe", 201, 700, 201, 200, 400),
+    # "往下滑" / "scroll up" = reveal content above (finger goes down)
+    "往下滑":      ("swipe", 201, 200, 201, 700, 400),
+    "下滑":        ("swipe", 201, 200, 201, 700, 400),
+    "向下滑":      ("swipe", 201, 200, 201, 700, 400),
+    "swipe down":  ("swipe", 201, 200, 201, 700, 400),
+    "scroll up":   ("swipe", 201, 200, 201, 700, 400),
+    # ── Navigation keys ───────────────────────────────────────────────────────
+    "返回":        ("press_key", "BACK"),
+    "回上一頁":    ("press_key", "BACK"),
+    "back":        ("press_key", "BACK"),
+    "go back":     ("press_key", "BACK"),
+    "go home":     ("press_key", "HOME"),
+    "home":        ("press_key", "HOME"),
+    "回home":      ("press_key", "HOME"),
+    "回主畫面":    ("press_key", "HOME"),
+}
+
+
+def _extract_input_text(task: str) -> Optional[str]:
+    """
+    For tasks like '輸入 X [in/on Y]' / 'type X [in Y]' / 'input_text X',
+    extract and return the text X that should be typed.
+
+    Examples:
+      '輸入https://google.com on address textfield' → 'https://google.com'
+      'input_text https://google.com'               → 'https://google.com'
+      'type hello world in search bar'              → 'hello world'
+      'input abc'                                   → 'abc'
+    """
+    t = task.strip()
+    # Ordered from most specific to most general.
+    patterns = [
+        # Explicit input_text command (MCP / CLI primitive)
+        r"^input_text\s+(https?://\S+)",
+        r"^input_text\s+(.+?)(?:\s+(?:in|on|at|to|into)\s+\S.*)?$",
+        # URL variants (no-space text)
+        r"^輸入\s*(https?://\S+)",
+        r"^input\s+(https?://\S+)",
+        r"^type\s+(https?://\S+)",
+        # General: capture text up to optional "in/on/at/to <field>" suffix
+        r"^輸入\s*(.+?)(?:\s+(?:in|on|at|to|into)\s+\S.*)?$",
+        r"^打字\s+(.+?)(?:\s+(?:in|on|at|to|into)\s+\S.*)?$",
+        r"^打入\s*(.+?)(?:\s+(?:in|on|at|to|into)\s+\S.*)?$",
+        r"^type\s+(.+?)(?:\s+(?:in|on|at|to|into)\s+\S.*)?$",
+        r"^input\s+(.+?)(?:\s+(?:in|on|at|to|into)\s+\S.*)?$",
+    ]
+    for pat in patterns:
+        m = re.match(pat, t, re.I)
+        if m:
+            text = m.group(1).strip()
+            if text:
+                return text
+    return None
+
+
+def _detect_gesture(task: str) -> Optional[Action]:
+    """
+    If *task* is a simple atomic gesture keyword, return the corresponding
+    Action immediately (no Qwen needed).  Returns None otherwise.
+
+    Matching is done on the normalised task string; any surrounding whitespace
+    or punctuation is stripped so "往右滑！" still matches "往右滑".
+    """
+    t = task.strip().rstrip("！!。.").lower()
+    spec = _GESTURE_MAP.get(t)
+    if spec is None:
+        # Try substring match for short tasks (e.g. "請往右滑一下")
+        for kw, s in _GESTURE_MAP.items():
+            if kw in t and len(t) <= len(kw) + 8:
+                spec = s
+                break
+    if spec is None:
+        return None
+
+    action_type = spec[0]
+    if action_type == "swipe":
+        _, x, y, x2, y2, dur = spec
+        return Action(
+            action_type="swipe", x=x, y=y, x2=x2, y2=y2, duration_ms=dur,
+            reasoning=f"Gesture fast-path: {task!r}",
+        )
+    if action_type == "press_key":
+        return Action(
+            action_type="press_key", key=spec[1],
+            reasoning=f"Gesture fast-path: {task!r}",
+        )
+    return None
+
 
 def _best_tap_from_elements(elements: list[dict], query: str) -> Action:
     """
@@ -52,10 +174,15 @@ def _best_tap_from_elements(elements: list[dict], query: str) -> Action:
     best = max(elements, key=score)
     from_acc = best.get("description") == "from_accessibility"
 
-    # Use the pre-computed center if available (from accessibility it's already logical pts)
-    center = best.get("center", [])
-    if center and len(center) == 2:
+    # Accessibility elements typically provide cx/cy in logical points.
+    if "cx" in best and "cy" in best:
+        cx, cy = int(best.get("cx", 0)), int(best.get("cy", 0))
+    # UI grounding elements usually provide center/bbox in norm1000.
+    # Use the pre-computed center if available.
+    elif best.get("center") and len(best.get("center", [])) == 2:
+        center = best.get("center", [])
         cx, cy = center[0], center[1]
+    # Fallback to bbox center if present.
     else:
         bbox = best.get("bbox", [0, 0, 0, 0])
         cx = (bbox[0] + bbox[2]) // 2
@@ -92,7 +219,7 @@ def _best_acc_match(elements: list[dict], query: str) -> Action:
     )
 
 
-# Task "打開 X app" / "open X app" → match foreground by name or bundle_id
+# Task patterns that mean "open / launch / tap an app"
 _OPEN_APP_NORMALIZE = {"檔案": "files", "設定": "settings", "相片": "photos", "日曆": "calendar"}
 _OPEN_APP_BUNDLE_SUBSTR = {
     "files": ["documentsapp", "files"],
@@ -101,20 +228,44 @@ _OPEN_APP_BUNDLE_SUBSTR = {
     "calendar": ["mobilecal", "calendar"],
 }
 
+# All phrasings that mean "open / tap / launch app X".
+# Each pattern must have exactly one capture group for the app name.
+_APP_TASK_PATTERNS = [
+    r"打開\s*([^\s]+)(?:\s*app)?",
+    r"open\s+(\w+)(?:\s+app)?",
+    r"點\s*([^\s]+)(?:\s*app)?",       # 點 watch app / 點watch
+    r"點擊\s*([^\s]+)(?:\s*app)?",     # 點擊 watch app
+    r"tap\s+(\w+)(?:\s*app)?",         # tap watch / tap watch app
+    r"click\s+(\w+)(?:\s*app)?",       # click watch
+    r"launch\s+(\w+)(?:\s*app)?",      # launch watch
+]
+
+
+def _extract_app_target(task: str) -> Optional[str]:
+    """
+    Return the normalised app name from any recognised app-task phrasing,
+    or None if the task doesn't look like an open/tap-app command.
+    """
+    t = task.strip()
+    for pat in _APP_TASK_PATTERNS:
+        m = re.search(pat, t, re.I)
+        if m:
+            x = m.group(1).strip().lower()
+            x_norm = _OPEN_APP_NORMALIZE.get(x, x)
+            if len(x_norm) >= 2:
+                return x_norm
+    return None
+
 
 def _open_app_tap_if_visible(task: str, acc_elements: list) -> Optional[Action]:
     """
-    If task is '打開 X app' and the X icon is visible as a Button in elements,
-    return a direct tap action — no Qwen needed.
+    If task is an open/tap-app command and the app icon is visible as a
+    Button in elements, return a direct tap action — no Qwen needed.
     """
     if not acc_elements:
         return None
-    m = re.search(r"打開\s*([^\s]+)(?:\s*app)?", task) or re.search(r"open\s+(\w+)\s+app", task, re.I)
-    if not m:
-        return None
-    x = m.group(1).strip().lower()
-    x_norm = _OPEN_APP_NORMALIZE.get(x, x)
-    if len(x_norm) < 2:
+    x_norm = _extract_app_target(task)
+    if x_norm is None:
         return None
     keywords = [x_norm] + _OPEN_APP_BUNDLE_SUBSTR.get(x_norm, [])
     visible_buttons = [
@@ -136,9 +287,111 @@ def _open_app_tap_if_visible(task: str, acc_elements: list) -> Optional[Action]:
     return None
 
 
+def _url_task_done_from_elements(task: str, acc_elements: list[dict]) -> Optional[Action]:
+    """
+    Fast-path for URL tasks: if target host is visible in accessibility labels/values,
+    treat as loaded and done.
+    """
+    m = re.search(r"https?://[^\s'\"）)]+", task, re.I)
+    if not m:
+        return None
+    try:
+        host = (urlparse(m.group(0)).netloc or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return None
+    host = host[4:] if host.startswith("www.") else host
+    visible = [e for e in acc_elements if e.get("visible", True)]
+    haystack = " ".join(
+        f"{e.get('label', '')} {e.get('value', '')}".strip()
+        for e in visible
+    ).lower()
+    if host in haystack:
+        return Action(
+            action_type="done",
+            result=f"Target URL host '{host}' is visible on screen.",
+            reasoning="Deterministic verification: accessibility labels/values include the target host.",
+        )
+    return None
+
+
+def _url_navigation_fast_action(
+    task: str,
+    acc_elements: list[dict],
+    keyboard_open: bool,
+    history: list[dict],
+    foreground_app: Optional[dict] = None,
+) -> Optional[Action]:
+    """
+    Deterministic fast-path for URL navigation tasks:
+      1) If keyboard is open -> input URL (or press ENTER after input)
+      2) Else tap address/search field by accessibility label
+    """
+    m = re.search(r"https?://[^\s'\"）)]+", task, re.I)
+    if not m:
+        return None
+    bid = (foreground_app or {}).get("bundle_id", "").lower()
+    name = (foreground_app or {}).get("name", "").lower()
+    if "safari" not in bid and "safari" not in name:
+        return None
+
+    target_url = m.group(0).strip()
+    last_action = str(history[-1].get("action", "")) if history else ""
+    last2 = " | ".join(str(h.get("action", "")) for h in history[-2:])
+
+    if keyboard_open:
+        if target_url not in last2:
+            return Action(
+                action_type="input_text",
+                text=target_url,
+                reasoning="URL task fast-path: keyboard is open, input target URL directly.",
+            )
+        if "input_text" in last_action and "press_key(ENTER)" not in last2:
+            return Action(
+                action_type="press_key",
+                key="ENTER",
+                reasoning="URL task fast-path: submit typed URL with ENTER.",
+            )
+        return None
+
+    visible = [e for e in acc_elements if e.get("visible", True)]
+    candidates = []
+    for el in visible:
+        label = (el.get("label", "") or "").lower()
+        etype = (el.get("type", "") or "").lower()
+        if not label:
+            continue
+        score = 0
+        if any(k in label for k in ("address", "search", "url", "網址", "網站")):
+            score += 3
+        if any(k in label for k in ("enter website", "search or enter", "網址列", "address")):
+            score += 2
+        if etype in ("textfield", "searchfield"):
+            score += 2
+        if score > 0:
+            # Prefer top navigation field if multiple candidates exist.
+            y = int(el.get("cy", 437))
+            score += 1 if y < 180 else 0
+            candidates.append((score, el))
+
+    if candidates:
+        _, best = sorted(candidates, key=lambda p: p[0], reverse=True)[0]
+        candidate_action = f"tap({int(best.get('cx', 201))}, {int(best.get('cy', 100))})"
+        if candidate_action == last_action:
+            return None
+        return Action(
+            action_type="tap",
+            x=int(best.get("cx", 201)),
+            y=int(best.get("cy", 100)),
+            reasoning=f"URL task fast-path: tap address field '{best.get('label', '')}'.",
+        )
+    return None
+
+
 def _open_app_done_from_elements(task: str, acc_elements: list) -> Optional[Action]:
     """
-    Pure-elements fast-path for "打開 X app".
+    Pure-elements fast-path for open/tap-app tasks.
     If elements have Tab Bar + (No Recents | in-app empty state) AND an "X | Application"
     label that matches the target app → done, no MDB needed.
 
@@ -149,13 +402,8 @@ def _open_app_done_from_elements(task: str, acc_elements: list) -> Optional[Acti
     """
     if not acc_elements:
         return None
-    task = task.strip()
-    m = re.search(r"打開\s*([^\s]+)(?:\s*app)?", task) or re.search(r"open\s+(\w+)\s+app", task, re.I)
-    if not m:
-        return None
-    x = m.group(1).strip().lower()
-    x_norm = _OPEN_APP_NORMALIZE.get(x, x)
-    if len(x_norm) < 2:
+    x_norm = _extract_app_target(task.strip())
+    if x_norm is None:
         return None
 
     visible = [e for e in acc_elements if e.get("visible", True)]
@@ -187,7 +435,8 @@ def _open_app_done_if_foreground(
     task: str, foreground_app: dict, acc_elements: list
 ) -> Optional[Action]:
     """
-    Fast-path for "打開 X app": elements-first, MDB as fallback confirmation.
+    Fast-path for open/tap-app tasks: elements-first, MDB as fallback confirmation.
+    Handles all task phrasings: 打開 X app, open X, 點 X app, tap X, 點擊 X …
     Priority: pure elements check (no stale MDB issues) → MDB + elements combined.
     """
     # Try pure-elements path first (doesn't depend on MDB at all)
@@ -206,13 +455,8 @@ def _open_app_done_if_foreground(
     if not (has_tab_bar and has_in_app):
         return None
 
-    task_s = task.strip()
-    m = re.search(r"打開\s*([^\s]+)(?:\s*app)?", task_s) or re.search(r"open\s+(\w+)\s+app", task_s, re.I)
-    if not m:
-        return None
-    x = m.group(1).strip().lower()
-    x_norm = _OPEN_APP_NORMALIZE.get(x, x)
-    if len(x_norm) < 2:
+    x_norm = _extract_app_target(task.strip())
+    if x_norm is None:
         return None
     name = (foreground_app.get("name") or "").lower()
     bid = (foreground_app.get("bundle_id") or "").lower()
@@ -301,57 +545,101 @@ class Orchestrator:
             pass
         return False
 
-    def run(self, task: str, device_udid: str) -> TaskResult:
+    def run(self, task: str, device_udid: str, reset: bool = True) -> TaskResult:
+        """
+        Execute *task* on *device_udid*.
+
+        reset=True  (default / ``run`` command): press HOME first, navigate to the
+                    main home page, then start the ReAct loop.  Guarantees a clean,
+                    known-good starting state.
+
+        reset=False (``act`` command): start from whatever screen is currently
+                    visible.  Use this when you want to continue from a previous
+                    session or when the caller (e.g. an MCP client) has already
+                    placed the device in the desired state.
+        """
         logs: list[StepLog] = []
         history: list[dict] = []
 
-        log.info(f"Starting task: {task!r} on device {device_udid[:12]}...")
+        log.info(f"Starting task: {task!r} on device {device_udid[:12]}...  reset={reset}")
         task_plan: Optional[str] = None
 
-        # ── Pre-flight: ensure we start from the MAIN home screen page ──────────
-        # Main home page: has app icon Buttons (Files, Contacts…) AND ≤ 12 elements.
-        # Today View: also has dock but has 13+ elements (widgets). Distinguish by count.
-        def _on_main_home() -> bool:
+        if reset:
+            # ── Pre-flight: ensure we start from the MAIN home screen page ──────
+            # Main home page: has app icon Buttons (Files, Contacts…) AND ≤ 12 elements.
+            # Today View: also has dock but has 13+ elements (widgets). Distinguish by count.
+            def _on_main_home() -> bool:
+                try:
+                    els = self.mdb.list_elements(device_udid)
+                    visible = [e for e in els if e.get("visible", True)]
+                    # Main home: small element count + at least one app icon Button
+                    has_app_icons = any(
+                        e.get("type") == "Button" and len(e.get("label", "")) > 2
+                        for e in visible
+                    )
+                    return has_app_icons and len(visible) <= 12
+                except Exception:
+                    return False
+
             try:
-                els = self.mdb.list_elements(device_udid)
-                visible = [e for e in els if e.get("visible", True)]
-                labels = {e.get("label", "").lower() for e in visible}
-                # Main home: small element count + at least one app icon Button
-                has_app_icons = any(
-                    e.get("type") == "Button" and len(e.get("label", "")) > 2
-                    for e in visible
+                if not self._is_on_home_screen(device_udid):
+                    log.info("Not on home screen — pressing HOME to exit foreground app.")
+                    self.mdb.press_key(device_udid, "HOME")
+                    time.sleep(0.9)
+
+                if not _on_main_home():
+                    # Today View is to the LEFT of page 0; swipe LEFT (350→50) to go to page 0.
+                    log.info("On a side page (Today View?) — swiping left to main home page.")
+                    self.mdb.swipe(device_udid, 350, 437, 50, 437, 300)
+                    time.sleep(0.6)
+
+                if not _on_main_home():
+                    log.info("Still not on main home — pressing HOME once more.")
+                    self.mdb.press_key(device_udid, "HOME")
+                    time.sleep(0.6)
+
+                if not _on_main_home():
+                    log.info("Trying swipe left once more to reach page 0.")
+                    self.mdb.swipe(device_udid, 350, 437, 50, 437, 300)
+                    time.sleep(0.5)
+            except Exception as e:
+                log.warning(f"Pre-flight HOME/swipe failed (non-fatal): {e}")
+        else:
+            log.info("reset=False — skipping pre-flight, continuing from current screen.")
+
+        # ── Gesture fast-path ────────────────────────────────────────────────────
+        # For atomic gesture tasks (往右滑, swipe down, back, …) we skip the
+        # entire ReAct loop: execute the mapped MDB action once, then done.
+        # This gives deterministic direction (no Qwen hallucination) and
+        # instant completion (no verification needed for a pure gesture).
+        gesture_action = _detect_gesture(task)
+        if gesture_action is not None:
+            log.info(f"Gesture fast-path: {task!r} → {gesture_action}")
+            step_log = StepLog(step=1, action=gesture_action)
+            if self.on_step:
+                self.on_step(step_log)
+            try:
+                self.mdb.execute(device_udid, gesture_action)
+                log.info("Gesture executed OK")
+                time.sleep(0.3)
+            except Exception as e:
+                log.error(f"Gesture execute failed: {e}")
+                return TaskResult(
+                    success=False, task=task, steps_taken=1,
+                    conclusion=f"Gesture failed: {e}",
+                    plan=None, logs=[step_log], blocked_reason=str(e),
+                    device_udid=device_udid,
                 )
-                return has_app_icons and len(visible) <= 12
-            except Exception:
-                return False
+            return TaskResult(
+                success=True, task=task, steps_taken=1,
+                conclusion=f"Gesture '{task}' executed.",
+                plan=None, logs=[step_log], device_udid=device_udid,
+            )
 
-        try:
-            if not self._is_on_home_screen(device_udid):
-                log.info("Not on home screen — pressing HOME to exit foreground app.")
-                self.mdb.press_key(device_udid, "HOME")
-                time.sleep(0.9)
-
-            if not _on_main_home():
-                # Today View is to the LEFT of page 0; swipe LEFT (350→50) to go to page 0.
-                log.info("On a side page (Today View?) — swiping left to main home page.")
-                self.mdb.swipe(device_udid, 350, 437, 50, 437, 300)
-                time.sleep(0.6)
-
-            if not _on_main_home():
-                log.info("Still not on main home — pressing HOME once more.")
-                self.mdb.press_key(device_udid, "HOME")
-                time.sleep(0.6)
-
-            if not _on_main_home():
-                log.info("Trying swipe left once more to reach page 0.")
-                self.mdb.swipe(device_udid, 350, 437, 50, 437, 300)
-                time.sleep(0.5)
-        except Exception as e:
-            log.warning(f"Pre-flight HOME/swipe failed (non-fatal): {e}")
-
-        # Navigation stack: always starts with root frame
+        # Navigation stack root — label reflects whether we know the start point
+        root_label = "Root / Home Screen" if reset else "Current Screen (unknown)"
         nav_stack: list[NavFrame] = [
-            NavFrame(depth=0, screen_label="Root / Home Screen", action_taken=None, step=0)
+            NavFrame(depth=0, screen_label=root_label, action_taken=None, step=0)
         ]
         last_action_str: Optional[str] = None
         same_action_count = 0
@@ -500,16 +788,45 @@ class Orchestrator:
             except Exception as e:
                 log.debug(f"list_elements error (non-fatal): {e}")
 
+            # ── 1e. Keyboard-open fast-path for input_text / type / 輸入 ─────────
+            # When the keyboard is already open (e.g. after a previous act tap),
+            # we can type immediately without asking Qwen.
+            # Handles:  input_text X / type X / 輸入 X  (no field-tap needed).
+            _input_text_val: Optional[str] = None
+            if keyboard_open:
+                _input_text_val = _extract_input_text(task)
+            if _input_text_val and keyboard_open:
+                log.info(
+                    f"Keyboard open + input task — typing {_input_text_val!r} directly (skip Qwen)"
+                )
+                action = Action(
+                    action_type="input_text",
+                    text=_input_text_val,
+                    reasoning=f"Keyboard already open; typing {_input_text_val!r} directly.",
+                )
+            else:
+                action = None   # will be filled by fast-paths or Qwen below
+
             # ── 2. Qwen phase-1 (or MDB fast-path for "打開 X app") ─────────────
             set_current_screenshot(shot.png_bytes)
             foreground_app = self.mdb.get_foreground_app(device_udid)
             if foreground_app:
                 log.debug(f"Foreground app: {foreground_app.get('bundle_id')} ({foreground_app.get('name')})")
-            action = _open_app_done_if_foreground(task, foreground_app or {}, acc_elements)
             if action is not None:
+                pass   # keyboard fast-path already set action
+            elif (app_done := _open_app_done_if_foreground(task, foreground_app or {}, acc_elements)) is not None:
+                action = app_done
                 log.info(f"MDB foreground matches task → done (skip Qwen): {action.result}")
             elif (tap_action := _open_app_tap_if_visible(task, acc_elements)) is not None:
                 action = tap_action
+            elif (url_done := _url_task_done_from_elements(task, acc_elements)) is not None:
+                action = url_done
+                log.info(f"URL host visible in accessibility → done (skip Qwen): {action.result}")
+            elif (url_fast := _url_navigation_fast_action(
+                task, acc_elements, keyboard_open, history, foreground_app
+            )) is not None:
+                action = url_fast
+                log.info(f"URL task fast-path selected action (skip Qwen): {action}")
             else:
                 log.info("Qwen analyzing screen...")
                 t_qwen = time.time()
@@ -611,7 +928,7 @@ class Orchestrator:
                         action = Action(action_type="error", result=str(e))
 
                     if action.action_type in ("ground", "error"):
-                        action = _best_tap_from_elements(acc_elements, query)
+                        action = _best_acc_match(acc_elements, query)
                         log.warning(f"Phase-2 acc fallback — auto-picked: {action}")
 
                 else:
@@ -684,6 +1001,7 @@ class Orchestrator:
                 same_action_count = 0
 
             # ── 5. Log step ───────────────────────────────────────────────────
+            prev_action_str = str(history[-1]["action"]) if history else ""
             step_log.action = action
             logs.append(step_log)
             history.append({
@@ -698,22 +1016,31 @@ class Orchestrator:
             # ── 5b. Guard: input_text → done without ENTER ───────────────────
             # If Qwen calls done immediately after input_text (e.g. typed a URL
             # but forgot to press ENTER), intercept and inject press_key(ENTER).
-            last_was_input = (
-                len(history) >= 1 and
-                "input_text" in str(history[-1].get("action", ""))
-            )
+            last_was_input = "input_text" in prev_action_str
             if action.action_type == "done" and last_was_input:
-                log.warning(
-                    "Qwen called done right after input_text — "
-                    "injecting press_key(ENTER) to submit"
+                deterministic_done = (
+                    (action.reasoning or "").startswith("Deterministic verification")
+                    or "Target URL host" in (action.result or "")
                 )
-                enter_action = Action(
-                    action_type="press_key", key="ENTER",
-                    reasoning="Auto-injected ENTER after input_text before done.",
-                )
-                self.mdb.execute(device_udid, enter_action)
-                time.sleep(0.5)
-                # Continue the loop; Qwen will re-evaluate on the next step
+                if deterministic_done:
+                    log.info("Deterministic done signal after input_text — accepting done without ENTER injection.")
+                else:
+                    log.warning(
+                        "Qwen called done right after input_text — "
+                        "injecting press_key(ENTER) to submit"
+                    )
+                    enter_action = Action(
+                        action_type="press_key", key="ENTER",
+                        reasoning="Auto-injected ENTER after input_text before done.",
+                    )
+                    try:
+                        self.mdb.execute(device_udid, enter_action)
+                        history.append({"step": step, "action": str(enter_action), "auto_injected": True})
+                        time.sleep(0.5)
+                        # Continue the loop; Qwen will re-evaluate on the next step
+                        continue
+                    except Exception as e:
+                        log.warning(f"Auto ENTER injection failed: {e}")
 
             # ── 6. Terminal actions ────────────────────────────────────────────
             if action.action_type == "done":
@@ -724,6 +1051,26 @@ class Orchestrator:
                     verify_shot = self.mdb.screenshot(device_udid)
                     set_current_screenshot(verify_shot.png_bytes)
                     verify_elements = self.mdb.list_elements(device_udid)
+                    verify_foreground_app = self.mdb.get_foreground_app(device_udid)
+
+                    # Deterministic verification first (fast and stable).
+                    deterministic_done = (
+                        _open_app_done_if_foreground(
+                            task,
+                            verify_foreground_app or {},
+                            verify_elements,
+                        )
+                        or _url_task_done_from_elements(task, verify_elements)
+                    )
+                    if deterministic_done and deterministic_done.action_type == "done":
+                        log.info(f"Task done (deterministic verify): {deterministic_done.result}")
+                        return TaskResult(
+                            success=True, task=task, plan=task_plan,
+                            steps_taken=step,
+                            conclusion=deterministic_done.result or action.result or "Task completed.",
+                            logs=logs, device_udid=device_udid,
+                        )
+
                     verify_action = self.qwen.decide(
                         task=f"VERIFY ONLY: Is this task actually complete? Task: {task}\n"
                              f"Qwen previously said done: '{action.result}'\n"
@@ -737,7 +1084,8 @@ class Orchestrator:
                         step=step,
                         max_steps=self.max_steps,
                         nav_stack=nav_stack,
-                        foreground_app=foreground_app,
+                        foreground_app=verify_foreground_app,
+                        force_thinking=False,
                     )
                     log.info(f"Verification result: {verify_action}")
                     if verify_action.action_type == "done":
@@ -781,6 +1129,63 @@ class Orchestrator:
                 history[-1]["error"] = str(e)
                 time.sleep(0.3)
                 continue
+
+            # ── 7b. act mode: one action per call → return immediately ────────
+            # `act` (reset=False) is designed for MCP / vibe-coding callers that
+            # issue ONE atomic command at a time (tap, swipe, scroll, pan, back…).
+            # The caller uses `screen` to observe the result and decide next step.
+            # We never verify or loop — executing the action IS the success signal.
+            #
+            # Exception — input/type tasks: "輸入 X in Y" is semantically ONE
+            # intent but physically TWO MDB calls:
+            #   1. tap(field)      → focuses field, opens keyboard
+            #   2. input_text(X)   → types the content
+            # After the tap we extract X from the task, wait for the keyboard,
+            # and inject input_text directly — no second Qwen call needed.
+            if not reset:
+                _is_input_task = any(
+                    kw in task.lower()
+                    for kw in ("輸入", "input_text", "input ", "type ", "打字", "打入")
+                )
+                if _is_input_task and step == 1 and action.action_type == "tap":
+                    input_text_val = _extract_input_text(task)
+                    if input_text_val:
+                        time.sleep(0.8)   # wait for keyboard animation
+                        type_action = Action(
+                            action_type="input_text",
+                            text=input_text_val,
+                            reasoning=f"act input task: type {input_text_val!r}",
+                        )
+                        log.info(f"act mode input task: typing {input_text_val!r}")
+                        try:
+                            self.mdb.execute(device_udid, type_action)
+                            log.info("Input text executed OK")
+                        except Exception as e:
+                            log.error(f"Input text failed: {e}")
+                            return TaskResult(
+                                success=False, task=task, steps_taken=step,
+                                conclusion=f"Typed {input_text_val!r} but execute failed: {e}",
+                                plan=None, logs=logs, device_udid=device_udid,
+                                blocked_reason=str(e),
+                            )
+                        return TaskResult(
+                            success=True, task=task, steps_taken=step,
+                            conclusion=f"Typed {input_text_val!r} into field.",
+                            plan=None, logs=logs, device_udid=device_udid,
+                        )
+                    # No text extracted — fall through to normal step 2
+                    log.info(
+                        "act mode: tap for input task but no text extracted — "
+                        "continuing to step 2."
+                    )
+                else:
+                    time.sleep(0.3)   # let screen settle before caller polls
+                    log.info("act mode: action executed — returning done (one-shot).")
+                    return TaskResult(
+                        success=True, task=task, steps_taken=step,
+                        conclusion=f"Action completed: {action}",
+                        plan=None, logs=logs, device_udid=device_udid,
+                    )
 
             # ── 8. Update navigation stack ────────────────────────────────────
             if _is_navigation_action(action):

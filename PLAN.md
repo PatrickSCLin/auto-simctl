@@ -27,7 +27,7 @@ Close the vibe coding feedback gap: AI agent reads a task, takes screenshots fro
 | UI-UG server                | ✅ Done     | background HTTP on `:8081`, fallback only                     |
 | Server management CLI       | ✅ Done     | `cli.py server start/stop/status`                             |
 | Task cancellation           | ✅ Done     | new task cancels previous in-flight run                       |
-| MCP server                  | 🔲 Future  | FastMCP skeleton exists                                        |
+| MCP server                  | ✅ Done     | `get_screen_state` + `act` + `run_task` + `list_devices`      |
 | Android backend             | 🔲 Partial | structure complete, not battle-tested                          |
 
 ---
@@ -370,11 +370,38 @@ Used only as **fallback** when accessibility tree is empty (custom-drawn views, 
 
 ---
 
-### 8. `mcp_server/server.py` — Future MCP Integration
+### 8. `mcp_server/server.py` — MCP Integration
 
-- Exposes `run_task(task: str, device_udid: str)` as an MCP tool
-- Vibe coding IDEs (Cursor, Claude Desktop) can call this to autonomously validate mobile changes
-- Uses FastMCP framework
+Exposes four MCP tools via FastMCP 3.x:
+
+| Tool | Description |
+|------|-------------|
+| `list_devices()` | JSON array of all booted simulators + connected devices |
+| `get_screen_state(device_udid, include_screenshot)` | Current screen: JSON summary (foreground app, visible elements, scroll state) + screenshot image |
+| `act(task, device_udid)` | ONE atomic action from current state — no HOME reset. Handles gesture fast-paths (往右滑, scroll down, back…) without Qwen |
+| `run_task(task, device_udid, max_steps)` | Full autonomous multi-step AI task with HOME pre-flight reset |
+
+**Vibe coding loop:**
+```
+get_screen_state() → see current screen
+act("點 Watch app") → tap Watch
+get_screen_state() → confirm Watch opened
+act("往下滑") → scroll down
+...
+run_task("Open Settings → enable Dark Mode") → autonomous multi-step
+```
+
+**Setup:**
+```json
+{
+  "mcpServers": {
+    "auto-simctl": {
+      "command": "python3",
+      "args": ["/path/to/auto-simctl/mcp_server/server.py"]
+    }
+  }
+}
+```
 
 ---
 
@@ -440,6 +467,6 @@ iPhone 16 Pro: `@3.0x` scale → pixel = pt × 3. `ScreenSpec` handles all conve
 - **Android backend**: Structure complete but not battle-tested against real apps.
 - **UI-UG accuracy**: Coordinates from visual grounding are sometimes inaccurate on iOS; accessibility tree is always preferred.
 - **Multi-device**: Currently single-device per run; parallel runs not supported.
-- **MCP server**: Skeleton only — not connected to the orchestrator yet.
+- **MCP server**: Fully connected; `get_screen_state` returns screenshot + accessibility JSON; `act` is one-shot; `run_task` is fully autonomous.
 - **Thinking budget**: `enable_thinking=True` is required for 9B model accuracy but adds 10–30s per step. A lighter model or per-task budget would help.
 - **Model upgrades**: Architecture supports any OpenAI-compatible model at `:8080`; Qwen model path is configurable.

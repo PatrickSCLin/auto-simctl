@@ -68,15 +68,37 @@ _NO_THINKING_PATTERNS = [
 ]
 
 
-def _needs_thinking(task: str) -> bool:
+def _needs_thinking(
+    task: str,
+    step: int,
+    grounding_phase: bool,
+    ui_elements_count: int,
+    has_recent_error: bool,
+) -> bool:
     """
     Heuristic: True = use chain-of-thought (slower but accurate).
     Thinking is OFF only for tasks where Qwen has a MDB/elements fast-path
     and won't need to estimate coordinates itself. For everything else, use thinking.
     """
-    # Always think — the no-thinking model produces invalid coordinates too often.
-    # TODO: revisit when we have a lighter model or better coordinate grounding.
-    return True
+    if grounding_phase:
+        # Phase-2 is usually direct selection from already-grounded candidates.
+        return False
+    if has_recent_error:
+        # Recovery steps benefit from deeper reasoning.
+        return True
+
+    t = task.lower()
+    if any(kw in t for kw in ("然後", "接著", "then", "after that")) and step > 2:
+        return True
+    if any(kw in t for kw in _THINKING_KEYWORDS):
+        return True
+    if any(re.search(pat, t, re.I) for pat in _NO_THINKING_PATTERNS):
+        return False
+
+    # If accessibility context is rich and we're still early, prefer faster decoding.
+    if ui_elements_count >= 8 and step <= 3:
+        return False
+    return ui_elements_count == 0
 
 
 class QwenAgent:
@@ -174,6 +196,7 @@ class QwenAgent:
         keyboard_open: bool = False,
         screenshot_url: Optional[str] = None,
         foreground_app: Optional[dict] = None,
+        force_thinking: Optional[bool] = None,
     ) -> Action:
         """
         Phase 1 (grounding_result=None):
@@ -222,14 +245,22 @@ class QwenAgent:
         if log.isEnabledFor(10):  # DEBUG
             log.debug("request messages (image redacted): %s", _redact_image_from_content(messages))
 
-        thinking = _needs_thinking(task)
+        has_recent_error = any(bool(h.get("error")) for h in history[-2:])
+        thinking = force_thinking if force_thinking is not None else _needs_thinking(
+            task=task,
+            step=step,
+            grounding_phase=(grounding_result is not None),
+            ui_elements_count=len(ui_elements),
+            has_recent_error=has_recent_error,
+        )
+        max_out_tokens = self.max_tokens if thinking else min(self.max_tokens, 768)
         log.info(f"Qwen thinking={'on' if thinking else 'off'} for task: {task!r:.60}")
 
         t0 = time.time()
         response = client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=self.max_tokens,
+            max_tokens=max_out_tokens,
             temperature=self.temperature,
             extra_body={
                 "chat_template_kwargs": {"enable_thinking": thinking},
@@ -272,10 +303,10 @@ class QwenAgent:
                     retry_resp = client.chat.completions.create(
                         model=self.model_name,
                         messages=retry_messages,
-                        max_tokens=self.max_tokens,
+                        max_tokens=min(max_out_tokens, 512),
                         temperature=self.temperature,
                         extra_body={
-                            "chat_template_kwargs": {"enable_thinking": True},
+                            "chat_template_kwargs": {"enable_thinking": True if thinking else False},
                             "repetition_penalty": self.repetition_penalty,
                         },
                     )

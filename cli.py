@@ -3,7 +3,9 @@ auto-simctl CLI — typer + rich entry point.
 
 Commands:
   devices          List connected devices
-  run <task>       Run an AI task on a device (requires servers running)
+  run <task>       Run an AI task (resets to home screen first)
+  act <task>       Run an AI task from the CURRENT screen — no HOME reset
+  screen           Show current screen state: foreground app + UI elements
   screenshot       Take a screenshot and save it
   boot             Boot an iOS Simulator
   server start     Start both Qwen + UI-UG inference servers (background)
@@ -261,6 +263,197 @@ def run(
         rprint(f"[dim]Full result saved to {output}[/dim]")
 
     raise typer.Exit(0 if result.success else 1)
+
+
+@app.command()
+def act(
+    task: str = typer.Argument(..., help="Task to perform starting from the CURRENT screen state"),
+    device: str = typer.Option("auto", "--device", "-d", help="Device UDID or 'auto'"),
+    max_steps: int = typer.Option(20, "--max-steps", "-n", help="Maximum steps before giving up"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Save full result JSON to file"),
+    no_server: bool = typer.Option(False, "--no-server", help="Skip server check"),
+):
+    """Continue acting from the CURRENT screen — no HOME reset.
+
+    Unlike `run`, this command does NOT press HOME or navigate to the launcher
+    first.  Use it when the device is already in the desired starting state
+    (e.g. an app is open) and you want to issue follow-up instructions without
+    losing your place.
+
+    Designed for MCP / vibe-coding callers that act as the brain and issue
+    incremental instructions such as:  scroll down, tap Settings, go back, etc.
+    """
+    from agents.qwen_agent import QwenAgent
+    from mdb.bridge import DeviceBridge
+
+    console.print(Panel(
+        f"[bold cyan]Task (from current state):[/bold cyan] {task}\n"
+        f"[dim]Device: {device} | Max steps: {max_steps} | No HOME reset[/dim]",
+        title="auto-simctl · act",
+        border_style="cyan",
+    ))
+
+    # Cancel any running task
+    prev_pid = _read_pid(_TASK_PID_FILE)
+    if prev_pid and _pid_alive(prev_pid):
+        import signal as _sig
+        rprint(f"[yellow]Cancelling previous task (PID {prev_pid})…[/yellow]")
+        os.kill(prev_pid, _sig.SIGTERM)
+        time.sleep(0.5)
+    _write_pid(_TASK_PID_FILE, os.getpid())
+
+    # Resolve device
+    bridge = DeviceBridge()
+    if device == "auto":
+        dev = bridge.first_device()
+        if dev is None:
+            rprint("[red]No devices available.[/red] Connect a device or start a Simulator.")
+            raise typer.Exit(1)
+        device = dev.udid
+
+    dev_info = bridge.get_device(device)
+    rprint(f"[dim]Using device: {dev_info}[/dim]")
+
+    # Check servers
+    from agents.ui_agent import UIAgent
+    qwen = QwenAgent()
+    ui_check = UIAgent()
+    if not no_server:
+        qwen_ok = qwen.server_running()
+        uiug_ok = ui_check.server_running()
+        if not qwen_ok or not uiug_ok:
+            missing = []
+            if not qwen_ok: missing.append("Qwen (port 8080)")
+            if not uiug_ok: missing.append("UI-UG (port 8081)")
+            rprint(f"[red]Servers not running:[/red] {', '.join(missing)}")
+            rprint("Start both with: [cyan]python3 cli.py server start[/cyan]")
+            raise typer.Exit(1)
+
+    step_logs = []
+
+    def on_step(log):
+        step_logs.append(log)
+        console.print(_step_panel(log))
+
+    orch = _make_orchestrator(max_steps=max_steps, on_step=on_step)
+
+    start = time.time()
+    result = orch.run(task=task, device_udid=device, reset=False)
+    elapsed = time.time() - start
+
+    border = "green" if result.success else "red"
+    icon = "✓" if result.success else "✗"
+    console.print(Panel(
+        f"[bold]{icon} {'Success' if result.success else 'Failed'}[/bold]\n\n"
+        f"{result.conclusion}\n\n"
+        f"[dim]Steps: {result.steps_taken}/{max_steps}  |  Time: {elapsed:.1f}s[/dim]"
+        + (f"\n[yellow]Blocked: {result.blocked_reason}[/yellow]" if result.blocked_reason else ""),
+        title="Result",
+        border_style=border,
+    ))
+
+    if output:
+        output.write_text(result.to_json(), encoding="utf-8")
+        rprint(f"[dim]Full result saved to {output}[/dim]")
+
+    raise typer.Exit(0 if result.success else 1)
+
+
+@app.command()
+def screen(
+    device: str = typer.Option("auto", "--device", "-d", help="Device UDID or 'auto'"),
+    json_out: bool = typer.Option(False, "--json", help="Output as JSON (for MCP / scripting)"),
+    save_screenshot: Optional[Path] = typer.Option(
+        None, "--screenshot", "-s", help="Save screenshot PNG to this path"
+    ),
+):
+    """Show the current screen state: foreground app, UI elements, scroll info.
+
+    Designed for MCP / vibe-coding callers that need to understand what is on
+    screen before deciding what action to take next.  Outputs a human-readable
+    table by default; use --json for machine-readable output.
+    """
+    from mdb.bridge import DeviceBridge
+
+    bridge = DeviceBridge()
+    if device == "auto":
+        dev = bridge.first_device()
+        if dev is None:
+            rprint("[red]No devices available.[/red]")
+            raise typer.Exit(1)
+        device = dev.udid
+
+    with console.status("[cyan]Reading screen state…[/cyan]"):
+        shot = bridge.screenshot(device)
+        acc_elements = bridge.list_elements(device)
+        scroll_info = bridge.get_scroll_info(device) if acc_elements else {}
+        foreground_app = bridge.get_foreground_app(device)
+
+    keyboard_open = any(
+        e.get("type") == "Button" and len(e.get("label", "").strip()) == 1
+        for e in acc_elements
+    )
+    visible = [e for e in acc_elements if e.get("visible", True)]
+    offscreen = [e for e in acc_elements if not e.get("visible", True)]
+
+    if save_screenshot:
+        save_screenshot.write_bytes(shot.png_bytes)
+        rprint(f"[dim]Screenshot saved → {save_screenshot}  ({len(shot.png_bytes)//1024} KB)[/dim]")
+
+    if json_out:
+        import base64 as _b64
+        data = {
+            "foreground_app": foreground_app,
+            "keyboard_open": keyboard_open,
+            "scroll": scroll_info,
+            "visible_elements": [
+                {k: e[k] for k in ("label", "type", "cx", "cy") if k in e}
+                for e in visible
+            ],
+            "offscreen_elements": [
+                {k: e[k] for k in ("label", "type") if k in e}
+                for e in offscreen
+            ],
+            "screenshot_base64": _b64.b64encode(shot.png_bytes).decode() if not save_screenshot else None,
+        }
+        console.print_json(json.dumps(data))
+        return
+
+    # ── Human-readable output ─────────────────────────────────────────────────
+    app_line = "unknown"
+    if foreground_app:
+        app_line = f"{foreground_app.get('name', '?')}  ({foreground_app.get('bundle_id', '?')})"
+    console.print(Panel(
+        f"[bold]Foreground app:[/bold] {app_line}\n"
+        f"[bold]Keyboard open:[/bold] {'yes' if keyboard_open else 'no'}\n"
+        f"[bold]Scroll:[/bold] "
+        + (f"↑above={scroll_info.get('has_content_above')}  "
+           f"↓below={scroll_info.get('has_content_below')}" if scroll_info else "n/a"),
+        title="Screen State",
+        border_style="cyan",
+    ))
+
+    if visible:
+        tbl = Table(title=f"Visible elements ({len(visible)})", show_header=True,
+                    header_style="bold cyan")
+        tbl.add_column("Label", min_width=20)
+        tbl.add_column("Type", width=16)
+        tbl.add_column("cx", width=6)
+        tbl.add_column("cy", width=6)
+        for e in visible:
+            tbl.add_row(
+                e.get("label", ""),
+                e.get("type", ""),
+                str(e.get("cx", "")),
+                str(e.get("cy", "")),
+            )
+        console.print(tbl)
+
+    if offscreen:
+        off_labels = ", ".join(e.get("label", "") for e in offscreen[:10])
+        if len(offscreen) > 10:
+            off_labels += f" … (+{len(offscreen)-10} more)"
+        rprint(f"[dim]Off-screen ({len(offscreen)}): {off_labels}[/dim]")
 
 
 @app.command()
